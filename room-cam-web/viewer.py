@@ -1,54 +1,69 @@
 """
-Room Cam Web — optional desktop viewer.
+Room Cam Web — LISTENER (runs on your laptop).
 
-For the web version, the easiest client is just a BROWSER: open the public
-https URL the server prints, log in with admin / 1337, done. This script is a
-bonus if you'd rather have a dedicated window.
+Fully automatic: it reads the rendezvous mailbox (a GitHub gist) to find the
+server's current public URL, then opens the live feed in your browser. No IP
+addresses, no copying URLs — the server publishes where it is, this finds it.
 
-Point PUBLIC_URL at the ngrok URL the server printed (or a http://IP:5000 on
-the same network), then run:  python viewer.py
+    python viewer.py          (uses only the Python standard library)
 
-NOTE on ngrok's free tier: the first visit to an *.ngrok-free.app URL shows an
-"interstitial" warning page a browser clicks through. OpenCV can't click it, so
-this script may fail against a free-tier tunnel. If the feed won't open, use a
-browser instead (open the URL, log in, watch) — that's the reliable path.
+Log in with admin / 1337 when the browser asks.
 """
 
-import cv2
+import json
+import time
+import urllib.request
+import webbrowser
 
-# ---- Set this to what the server printed ------------------------------------
-PUBLIC_URL = "https://REPLACE-ME.ngrok-free.app"   # or http://192.168.x.x:5000
+# ---- Must match webcam_server.py -------------------------------------------
+GIST_ID = "51afc120ecb7715badd3c0ac391d8bdc"
+GIST_FILENAME = "roomcam_url.txt"
 USERNAME = "admin"
 PASSWORD = "1337"
 # ---------------------------------------------------------------------------
 
-# Build an authenticated stream URL:  https://user:pass@host/video
-_scheme, _rest = PUBLIC_URL.split("://", 1)
-STREAM_URL = f"{_scheme}://{USERNAME}:{PASSWORD}@{_rest.rstrip('/')}/video"
+
+def fetch_url_from_gist():
+    """Read the current public URL the server published into the gist mailbox.
+
+    Uses the public GitHub API by gist ID — no token needed, even for a secret
+    gist, and it isn't CDN-cached so we always get the latest URL.
+    """
+    # The ?_=<ms> cache-buster gives the CDN a unique URL each time, so we get
+    # the freshly published value instead of a cached one.
+    req = urllib.request.Request(
+        f"https://api.github.com/gists/{GIST_ID}?_={int(time.time() * 1000)}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "room-cam-web",
+            "Cache-Control": "no-cache",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode())
+    files = data.get("files", {})
+    if GIST_FILENAME not in files:
+        return None
+    return (files[GIST_FILENAME]["content"] or "").strip()
 
 
 def main():
-    print(f"Connecting to {PUBLIC_URL} ...")
-
-    stream = cv2.VideoCapture(STREAM_URL)
-
-    if not stream.isOpened():
-        print("Couldn't open the stream. Check PUBLIC_URL / login, or just use")
-        print("a browser: open the URL, log in, and watch there.")
+    print("Reading the rendezvous mailbox...")
+    try:
+        url = fetch_url_from_gist()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Couldn't read the mailbox: {exc}")
         return
 
-    print("Connected. Press 'q' in the window to quit.")
-    while True:
-        ok, frame = stream.read()
-        if not ok:
-            print("Stream ended or blocked (ngrok interstitial?). Try a browser.")
-            break
-        cv2.imshow("Room Cam Web", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+    if not url or url == "pending":
+        print("The server hasn't published a URL yet.")
+        print("Start webcam_server.py on the host, wait a few seconds, re-run this.")
+        return
 
-    stream.release()
-    cv2.destroyAllWindows()
+    print(f"Server is live at: {url}")
+    print(f"Opening it in your browser — log in with {USERNAME} / {PASSWORD}.")
+    print("(ngrok's free tier shows a 'Visit Site' page first; click through once.)")
+    webbrowser.open(url)
 
 
 if __name__ == "__main__":

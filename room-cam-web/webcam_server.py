@@ -29,10 +29,12 @@ strong and private before you rely on this.
 
 import datetime
 import hmac
+import json
 import logging
 import os
 import threading
 import time
+import urllib.request
 from collections import deque
 
 import cv2
@@ -44,6 +46,14 @@ PORT = 5000
 JPEG_QUALITY = 80
 REOPEN_AFTER_FAILURES = 30
 ENABLE_TUNNEL = True    # False = run local-only (same-network), skip ngrok
+
+# ---- Rendezvous mailbox (auto-tells the listener where to connect) ---------
+# On startup the server writes its current public URL into this gist. The
+# listener reads the gist to find the server automatically. Publishing needs a
+# GITHUB_TOKEN env var with 'gist' scope; reading (the listener) needs neither.
+PUBLISH_TO_GIST = True
+GIST_ID = "51afc120ecb7715badd3c0ac391d8bdc"
+GIST_FILENAME = "roomcam_url.txt"
 
 # ---- Login -----------------------------------------------------------------
 USERNAME = "admin"
@@ -251,26 +261,62 @@ def open_public_tunnel(port):
         return None
 
 
-if __name__ == "__main__":
-    print("=" * 62)
-    print("  Room Cam Web starting.  (Camera is OFF until a viewer connects.)")
+def publish_url_to_gist(url):
+    """Write the current public URL into the gist mailbox so the listener can
+    discover it. Needs GIST_ID set and a GITHUB_TOKEN env var with 'gist' scope.
+    Returns True on success.
+    """
+    if not PUBLISH_TO_GIST or not GIST_ID:
+        return False
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        log("GITHUB_TOKEN not set -> can't publish to the gist mailbox.")
+        return False
 
-    public_url = None
-    if ENABLE_TUNNEL:
-        public_url = open_public_tunnel(PORT)
+    body = json.dumps({"files": {GIST_FILENAME: {"content": url}}}).encode()
+    req = urllib.request.Request(
+        f"https://api.github.com/gists/{GIST_ID}",
+        data=body,
+        method="PATCH",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "room-cam-web",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ok = resp.status == 200
+        if ok:
+            log(f"Published public URL to gist mailbox: {url}")
+        else:
+            log(f"Gist publish returned HTTP {resp.status}")
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        log(f"Could not publish URL to gist: {exc}")
+        return False
 
+
+def _startup_tunnel_and_publish():
+    """Open the public tunnel and drop its URL in the mailbox. Runs in a
+    background thread so the web server starts serving immediately."""
+    public_url = open_public_tunnel(PORT)
     if public_url:
-        print(f"  PUBLIC url (any network):   {public_url}")
-        print(f"  Log in with:                {USERNAME} / {PASSWORD}")
+        log(f"PUBLIC url: {public_url}  (log in {USERNAME} / {PASSWORD})")
+        publish_url_to_gist(public_url)
     else:
-        print(f"  LOCAL url (same network):   http://localhost:{PORT}")
-        print("  (No public tunnel — see setup notes to enable ngrok.)")
+        log("No public tunnel -> serving on the local network only.")
 
+
+if __name__ == "__main__":
+    log("Room Cam Web starting. Camera is OFF until a viewer connects.")
     if PASSWORD == "1337":
-        print()
-        print("  !! WARNING: default password '1337' is public. Change PASSWORD")
-        print("     in this file before relying on internet access. !!")
-    print("  Press Ctrl+C to stop.")
-    print("=" * 62)
+        log("WARNING: default password '1337' is public — change it before "
+            "relying on internet access.")
+
+    # Open the tunnel + publish the URL in the background so the web server is
+    # up instantly (and a headless exe never blocks on ngrok).
+    if ENABLE_TUNNEL:
+        threading.Thread(target=_startup_tunnel_and_publish, daemon=True).start()
 
     app.run(host="0.0.0.0", port=PORT, threaded=True)
