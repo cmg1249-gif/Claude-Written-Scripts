@@ -1,37 +1,33 @@
 """
-Room Cam Web — internet-accessible webcam security camera.
+Room Cam Web — internet-accessible webcam (install, run, forget).
 
-A spin-off of room-cam. Same timestamped MJPEG feed and password gate
-(admin / 1337), but it opens a PUBLIC https tunnel with ngrok so you can watch
-from ANY network — not just the same Wi-Fi. The camera stays OFF until someone
-opens the feed (webcam light dark when nobody's watching).
+The host needs NO account, NO token, and NO configuration:
+  1. It opens a Cloudflare "quick tunnel" -> a public https URL (no login).
+  2. It posts that URL to a public ntfy.sh topic (no login) so the listener can
+     find it, and re-posts every few minutes to keep it fresh.
+The camera stays OFF until someone opens the feed (webcam light dark when idle).
 
-Setup (once):
+Run (or just double-click the exe):
     pip install -r requirements.txt
-    # Free ngrok account -> copy your authtoken:
-    #   https://dashboard.ngrok.com/signup
-    # Then register it ONE of these ways:
-    #   ngrok config add-authtoken <YOUR_TOKEN>
-    #   -- or set an environment variable named NGROK_AUTHTOKEN
-
-Run:
     python webcam_server.py
 
-It prints a PUBLIC url like https://ab12cd34.ngrok-free.app — open that in a
-browser on any device, log in with admin / 1337, and you're watching.
+The listener (viewer.py, on your laptop) reads the ntfy topic, finds this
+server automatically, and opens the feed. Log in with admin / 1337.
 
 >>> SECURITY <<<
-This exposes your webcam to the public internet behind ONE password. The
-default 'admin' / '1337' is a demo and is publicly known (it's in the repo),
-so anyone who finds your URL could try it. CHANGE PASSWORD below to something
-strong and private before you rely on this.
+This exposes your webcam to the public internet behind ONE password. The ntfy
+topic is public (anyone who knows it can read the current URL), so the password
+is the real gate. '1337' is a demo default and is publicly known -- change
+PASSWORD below before you rely on this.
 """
 
+import configparser
 import datetime
 import hmac
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import urllib.request
@@ -40,24 +36,32 @@ from collections import deque
 import cv2
 from flask import Flask, Response, jsonify, request
 
-# ---- Settings you can tweak ------------------------------------------------
-CAMERA_INDEX = 0
-PORT = 5000
+# ---- Config: you should NEVER need to edit this code -----------------------
+# Real settings are resolved at startup (see load_config) in this order:
+#   1. environment variable  (ROOMCAM_PASSWORD, ROOMCAM_TOPIC, ROOMCAM_PORT, ...)
+#   2. roomcam_config.ini     (written next to this file / the .exe)
+#   3. a first-run prompt      (console, or a pop-up for the no-console exe)
+#   4. the defaults below
+# The values below are only starting points; the .ini is the source of truth.
+DEFAULT_USERNAME = "admin"
+DEFAULT_PASSWORD = "1337"      # public demo value; you'll be asked to change it
+DEFAULT_TOPIC = "roomcam-relay-3f9k2m7qx4"  # ntfy rendezvous topic (shared name)
+DEFAULT_PORT = 5000
+DEFAULT_CAMERA_INDEX = 0
+
+# Filled in from config in __main__; functions read these globals at call time.
+USERNAME = DEFAULT_USERNAME
+PASSWORD = DEFAULT_PASSWORD
+NTFY_TOPIC = DEFAULT_TOPIC
+PORT = DEFAULT_PORT
+CAMERA_INDEX = DEFAULT_CAMERA_INDEX
+
+# ---- Fixed knobs (rarely changed) ------------------------------------------
 JPEG_QUALITY = 80
 REOPEN_AFTER_FAILURES = 30
-ENABLE_TUNNEL = True    # False = run local-only (same-network), skip ngrok
-
-# ---- Rendezvous mailbox (auto-tells the listener where to connect) ---------
-# On startup the server writes its current public URL into this gist. The
-# listener reads the gist to find the server automatically. Publishing needs a
-# GITHUB_TOKEN env var with 'gist' scope; reading (the listener) needs neither.
-PUBLISH_TO_GIST = True
-GIST_ID = "51afc120ecb7715badd3c0ac391d8bdc"
-GIST_FILENAME = "roomcam_url.txt"
-
-# ---- Login -----------------------------------------------------------------
-USERNAME = "admin"
-PASSWORD = "1337"       # CHANGE THIS before exposing to the internet!
+ENABLE_TUNNEL = True        # False = local-only (same-network), skip the tunnel
+PUBLISH_TO_MAILBOX = True   # post the public URL to the ntfy rendezvous topic
+REPUBLISH_SECONDS = 600     # re-post the URL this often so it stays fresh
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
@@ -176,7 +180,6 @@ def generate_frames():
             continue
 
 
-# A small browser page so opening the public URL "just works" on any device.
 INDEX_HTML = """<!doctype html>
 <html>
 <head>
@@ -201,7 +204,6 @@ INDEX_HTML = """<!doctype html>
 
 @app.route("/")
 def index():
-    """Browser-friendly page that embeds the live stream."""
     return INDEX_HTML
 
 
@@ -237,85 +239,152 @@ def logs():
 
 
 def open_public_tunnel(port):
-    """Open an ngrok https tunnel and return the public URL, or None on failure.
+    """Open a Cloudflare quick tunnel and return the public https URL, or None.
 
-    Requires pyngrok installed and an ngrok authtoken registered (via
-    `ngrok config add-authtoken` or the NGROK_AUTHTOKEN environment variable).
+    Quick tunnels need NO account and NO token -- just the cloudflared binary,
+    which pycloudflared downloads automatically on first use.
     """
     try:
-        from pyngrok import ngrok
+        from pycloudflared import try_cloudflare
     except ImportError:
-        log("pyngrok not installed -> running local-only. `pip install pyngrok`")
+        log("pycloudflared not installed -> local only. `pip install pycloudflared`")
         return None
-
-    token = os.environ.get("NGROK_AUTHTOKEN")
-    if token:
-        ngrok.set_auth_token(token)
-
     try:
-        tunnel = ngrok.connect(port, "http")
-        return tunnel.public_url
+        return try_cloudflare(port=port).tunnel
     except Exception as exc:  # noqa: BLE001
-        log(f"Could not open ngrok tunnel: {exc}")
-        log("Make an account + register your authtoken, then retry.")
+        log(f"Could not open Cloudflare tunnel: {exc}")
         return None
 
 
-def publish_url_to_gist(url):
-    """Write the current public URL into the gist mailbox so the listener can
-    discover it. Needs GIST_ID set and a GITHUB_TOKEN env var with 'gist' scope.
-    Returns True on success.
-    """
-    if not PUBLISH_TO_GIST or not GIST_ID:
+def publish_url_to_mailbox(url):
+    """Post the current public URL to the ntfy.sh topic. No token needed."""
+    if not PUBLISH_TO_MAILBOX or not NTFY_TOPIC:
         return False
-    token = os.environ.get("GITHUB_TOKEN")
-    if not token:
-        log("GITHUB_TOKEN not set -> can't publish to the gist mailbox.")
-        return False
-
-    body = json.dumps({"files": {GIST_FILENAME: {"content": url}}}).encode()
     req = urllib.request.Request(
-        f"https://api.github.com/gists/{GIST_ID}",
-        data=body,
-        method="PATCH",
-        headers={
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "room-cam-web",
-        },
+        f"https://ntfy.sh/{NTFY_TOPIC}",
+        data=url.encode(),
+        method="POST",
+        headers={"Title": "roomcam-url", "User-Agent": "room-cam-web"},
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             ok = resp.status == 200
         if ok:
-            log(f"Published public URL to gist mailbox: {url}")
-        else:
-            log(f"Gist publish returned HTTP {resp.status}")
+            log(f"Published public URL to mailbox: {url}")
         return ok
     except Exception as exc:  # noqa: BLE001
-        log(f"Could not publish URL to gist: {exc}")
+        log(f"Could not publish URL to mailbox: {exc}")
         return False
 
 
 def _startup_tunnel_and_publish():
-    """Open the public tunnel and drop its URL in the mailbox. Runs in a
+    """Open the tunnel, then keep the URL fresh in the mailbox. Runs in a
     background thread so the web server starts serving immediately."""
     public_url = open_public_tunnel(PORT)
-    if public_url:
-        log(f"PUBLIC url: {public_url}  (log in {USERNAME} / {PASSWORD})")
-        publish_url_to_gist(public_url)
-    else:
+    if not public_url:
         log("No public tunnel -> serving on the local network only.")
+        return
+    log(f"PUBLIC url: {public_url}  (log in {USERNAME} / {PASSWORD})")
+    while True:
+        publish_url_to_mailbox(public_url)
+        time.sleep(REPUBLISH_SECONDS)
+
+
+CONFIG_FILENAME = "roomcam_config.ini"
+CONFIG_SECTION = "roomcam"
+
+
+def _config_path():
+    """Where the config lives: next to the .exe when frozen, else next to this
+    script. So a double-clicked exe just reads a plain .ini beside it."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, CONFIG_FILENAME)
+
+
+def _ask(prompt_text, default):
+    """Ask for one value. Uses a console prompt when there is a console, falls
+    back to a small pop-up for the no-console exe, else keeps the default."""
+    if sys.stdin is not None and sys.stdin.isatty():
+        try:
+            return input(f"{prompt_text} [{default}]: ").strip() or default
+        except EOFError:
+            return default
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog
+        root = tk.Tk()
+        root.withdraw()
+        entered = simpledialog.askstring(
+            "Room Cam Web setup", prompt_text, initialvalue=default
+        )
+        root.destroy()
+        return (entered or default).strip()
+    except Exception:
+        return default
+
+
+def load_config():
+    """Resolve settings (env var -> .ini -> first-run prompt -> default) and
+    write them back to roomcam_config.ini, so nothing has to live in the code."""
+    path = _config_path()
+    cfg = configparser.ConfigParser()
+    if os.path.exists(path):
+        cfg.read(path)
+    if not cfg.has_section(CONFIG_SECTION):
+        cfg.add_section(CONFIG_SECTION)
+
+    defaults = {
+        "username": DEFAULT_USERNAME,
+        "password": DEFAULT_PASSWORD,
+        "topic": DEFAULT_TOPIC,
+        "port": str(DEFAULT_PORT),
+        "camera_index": str(DEFAULT_CAMERA_INDEX),
+    }
+    values = {}
+    for key, dflt in defaults.items():
+        env = os.environ.get("ROOMCAM_" + key.upper())
+        if env:
+            values[key] = env
+        elif cfg.has_option(CONFIG_SECTION, key) and cfg.get(CONFIG_SECTION, key):
+            values[key] = cfg.get(CONFIG_SECTION, key)
+        else:
+            values[key] = dflt
+
+    # First run with no config: prompt for a real password. This camera goes on
+    # the public internet -- the password is the only gate, so don't ship 1337.
+    if not os.path.exists(path) and values["password"] == DEFAULT_PASSWORD:
+        values["password"] = _ask(
+            "Set a viewer password (gates internet access)", DEFAULT_PASSWORD
+        )
+
+    for key in defaults:
+        cfg.set(CONFIG_SECTION, key, str(values[key]))
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            cfg.write(fh)
+    except OSError as exc:
+        log(f"Could not write config {path}: {exc}")
+    return values
 
 
 if __name__ == "__main__":
-    log("Room Cam Web starting. Camera is OFF until a viewer connects.")
-    if PASSWORD == "1337":
-        log("WARNING: default password '1337' is public — change it before "
-            "relying on internet access.")
+    _cfg = load_config()
+    USERNAME = _cfg["username"]
+    PASSWORD = _cfg["password"]
+    NTFY_TOPIC = _cfg["topic"]
+    PORT = int(_cfg["port"])
+    CAMERA_INDEX = int(_cfg["camera_index"])
 
-    # Open the tunnel + publish the URL in the background so the web server is
-    # up instantly (and a headless exe never blocks on ngrok).
+    log("Room Cam Web starting. Camera is OFF until a viewer connects.")
+    log(f"Config file: {_config_path()}")
+    log("Change settings there or via ROOMCAM_* env vars -- no code edits.")
+    if PASSWORD == DEFAULT_PASSWORD:
+        log("WARNING: password is still the public demo value -- set a real one "
+            "in the config file before relying on internet access.")
+
     if ENABLE_TUNNEL:
         threading.Thread(target=_startup_tunnel_and_publish, daemon=True).start()
 
