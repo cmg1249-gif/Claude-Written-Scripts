@@ -2,8 +2,10 @@
 Room Cam — VIEWER (runs on any machine on the same network).
 
 Fully automatic: it finds the host by UDP broadcast (no IP to enter), turns the
-host camera on, shows the live feed, and mirrors the host's log lines here. When
-you quit you can also turn the host camera off.
+host camera on, shows the live feed, and mirrors the host's log lines here. It
+keeps retrying discovery until the host appears, so you can launch the viewer
+before the host and it will connect the moment the host comes online. When you
+quit you can also turn the host camera off.
 
     pip install opencv-python
     python viewer.py
@@ -58,6 +60,26 @@ def discover_host(timeout=5):
         sock.close()
 
 
+def discover_host_retry(attempt_timeout=5):
+    """Keep broadcasting until a host answers, then return (ip, port).
+
+    Each attempt waits up to attempt_timeout seconds for a reply; if none
+    arrives we just try again, indefinitely. This means the viewer can be
+    started before the host -- it will connect the moment the host appears.
+    Raises KeyboardInterrupt if the user gives up with Ctrl+C.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        found = discover_host(timeout=attempt_timeout)
+        if found:
+            return found
+        # Don't spam: announce the first miss, then every ~30s of waiting.
+        if attempt == 1 or attempt % 6 == 0:
+            print("Still searching for the camera host... (Ctrl+C to stop)")
+        time.sleep(1.0)
+
+
 def api(base, path):
     """Call a host control endpoint (/start, /stop, /status, /logs)."""
     req = urllib.request.Request(
@@ -85,13 +107,12 @@ def stream_host_logs(base, stop_event):
 
 def main():
     print("Searching the network for the camera host...")
-    found = discover_host()
-    if not found:
-        print("No host answered. Is camera_server.py running on this network?")
-        print("(Both devices must be on the same Wi-Fi / LAN.)")
+    try:
+        ip, port = discover_host_retry()
+    except KeyboardInterrupt:
+        print("\nStopped searching.")
         return
 
-    ip, port = found
     base = f"http://{ip}:{port}"
     stream_url = f"http://{USERNAME}:{PASSWORD}@{ip}:{port}/video"
     print(f"Found the host at {ip}:{port}")

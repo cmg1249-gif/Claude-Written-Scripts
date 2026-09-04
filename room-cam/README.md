@@ -34,6 +34,8 @@ pip install opencv-python
 python viewer.py
 ```
 It finds the host, turns the camera on, and shows the live feed in a window.
+You can start the viewer **before** the host — it keeps searching until the
+host appears, then connects automatically (Ctrl+C to stop searching).
 
 Keys (with the video window focused):
 - `q` — quit **and** turn the host camera off
