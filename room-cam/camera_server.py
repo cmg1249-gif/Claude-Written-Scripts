@@ -39,6 +39,14 @@ REOPEN_AFTER_FAILURES = 30   # consecutive bad reads before we try to reopen
 QUIET_HOST = True       # True = host terminal stays silent; logs still go to
                         #        the viewer via /logs. False = also print here.
 
+# ---- LAN auto-discovery ----------------------------------------------------
+# The viewer finds this host by UDP broadcast, so there's NO hardcoded IP to
+# set. Same-network only, and it needs no tokens or config -- run and forget.
+ENABLE_DISCOVERY = True
+DISCOVERY_PORT = 50505
+DISCOVERY_REQUEST = b"ROOMCAM_DISCOVERY_V1"
+DISCOVERY_REPLY_PREFIX = b"ROOMCAM_HERE"
+
 # ---- Login (change these!) -------------------------------------------------
 USERNAME = "admin"          # who has to log in
 PASSWORD = "1337"           # CHANGE THIS to something only you know
@@ -237,7 +245,7 @@ def logs():
 
 
 def get_local_ip():
-    """Find this machine's LAN IP so you know what to put into viewer.py."""
+    """Find this machine's LAN IP (used in the discovery reply)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -249,17 +257,47 @@ def get_local_ip():
     return ip
 
 
+def discovery_responder():
+    """Answer LAN discovery pings so the viewer can find this host with no
+    hardcoded IP. Listens for a UDP broadcast request and replies to the sender
+    with our IP and stream port. No auth here -- it only reveals the LAN IP;
+    the stream itself is still password-protected.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", DISCOVERY_PORT))
+    except OSError as exc:
+        log(f"Discovery responder could not bind UDP {DISCOVERY_PORT}: {exc}")
+        return
+
+    log(f"Discovery responder listening on UDP {DISCOVERY_PORT}.")
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+        except OSError:
+            continue
+        if data.strip() == DISCOVERY_REQUEST:
+            reply = DISCOVERY_REPLY_PREFIX + f":{get_local_ip()}:{PORT}".encode()
+            try:
+                sock.sendto(reply, addr)
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     ip = get_local_ip()
     print("=" * 60)
     print("  Camera server is running.  (Camera is OFF until a viewer asks.)")
     print(f"  This machine's IP address:  {ip}")
-    print(f"  Control + stream base URL:  http://{ip}:{PORT}")
-    print()
-    print("  Put that IP into viewer.py on your laptop, then run it.")
-    print("  The viewer will turn the camera on, and can shut it off.")
+    print("  The viewer finds this host automatically -- no IP to enter.")
+    print("  Just run viewer.py on any machine on the same network.")
     print("  Press Ctrl+C to stop the whole server.")
     print("=" * 60)
+
+    # Answer LAN discovery pings so the viewer needs no hardcoded IP.
+    if ENABLE_DISCOVERY:
+        threading.Thread(target=discovery_responder, daemon=True).start()
 
     # host="0.0.0.0" makes it reachable from other devices on the LAN.
     # threaded=True lets it serve control calls and the stream at the same time.

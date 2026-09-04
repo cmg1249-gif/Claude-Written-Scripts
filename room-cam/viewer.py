@@ -1,24 +1,21 @@
 """
-Room Cam — VIEWER (runs on your laptop).
+Room Cam — VIEWER (runs on any machine on the same network).
 
-Connects to the always-on camera_server on the host. On launch it turns the
-host camera ON if it's off, shows the live feed in a window here, and streams
-the host's log lines to your laptop (prefixed [host]). When you quit you can
-also turn the host camera OFF.
+Fully automatic: it finds the host by UDP broadcast (no IP to enter), turns the
+host camera on, shows the live feed, and mirrors the host's log lines here. When
+you quit you can also turn the host camera off.
 
-Setup:
-    1. Leave camera_server.py running on the host machine.
-    2. Put its IP into HOST_IP below (and matching USERNAME / PASSWORD).
-    3. On your laptop:  pip install opencv-python
-    4. Run this file:   python viewer.py
+    pip install opencv-python
+    python viewer.py
 
 Keys (with the video window focused):
-    q  = quit AND turn the host camera OFF (shut it down)
-    l  = quit but LEAVE the host camera running (for other viewers)
+    q  = quit AND turn the host camera OFF
+    l  = quit but LEAVE the host camera running
 """
 
 import base64
 import json
+import socket
 import threading
 import time
 import urllib.error
@@ -26,105 +23,121 @@ import urllib.request
 
 import cv2
 
-# ---- Change these to match camera_server.py --------------------------------
-HOST_IP = "192.168.1.42"        # the IP camera_server.py printed
-PORT = 5000
-USERNAME = "admin"              # must match USERNAME in camera_server.py
-PASSWORD = "1337"              # must match PASSWORD in camera_server.py
+# ---- Must match camera_server.py -------------------------------------------
+USERNAME = "admin"
+PASSWORD = "1337"
+DISCOVERY_PORT = 50505
+DISCOVERY_REQUEST = b"ROOMCAM_DISCOVERY_V1"
+DISCOVERY_REPLY_PREFIX = "ROOMCAM_HERE"
 # ---------------------------------------------------------------------------
 
-BASE = f"http://{HOST_IP}:{PORT}"
-# The username:password@ form sends the login along with the video request.
-STREAM_URL = f"http://{USERNAME}:{PASSWORD}@{HOST_IP}:{PORT}/video"
 _AUTH_HEADER = "Basic " + base64.b64encode(
     f"{USERNAME}:{PASSWORD}".encode()
 ).decode()
 
 
-def api(path):
-    """Call a host control endpoint (/start, /stop, /status, /logs).
+def discover_host(timeout=5):
+    """Broadcast a discovery ping and wait for the host to answer with its IP
+    and stream port. Returns (ip, port) or None if nobody answered in time."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(DISCOVERY_REQUEST, ("255.255.255.255", DISCOVERY_PORT))
+        while True:
+            data, addr = sock.recvfrom(1024)
+            text = data.decode(errors="ignore").strip()
+            if text.startswith(DISCOVERY_REPLY_PREFIX):
+                parts = text.split(":")
+                ip = parts[1] if len(parts) > 1 and parts[1] else addr[0]
+                port = parts[2] if len(parts) > 2 else "5000"
+                return ip, port
+    except (socket.timeout, OSError):
+        return None
+    finally:
+        sock.close()
 
-    Returns the parsed JSON dict, or None if the host couldn't be reached.
-    """
+
+def api(base, path):
+    """Call a host control endpoint (/start, /stop, /status, /logs)."""
     req = urllib.request.Request(
-        f"{BASE}{path}", headers={"Authorization": _AUTH_HEADER}
+        f"{base}{path}", headers={"Authorization": _AUTH_HEADER}
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read().decode())
-    except Exception as exc:  # noqa: BLE001 - any failure means "host not reachable"
+    except Exception as exc:  # noqa: BLE001
         print(f"[viewer] control call {path} failed: {exc}")
         return None
 
 
-def stream_host_logs(stop_event):
+def stream_host_logs(base, stop_event):
     """Poll the host's /logs in the background and print only NEW lines here."""
     shown = 0
     while not stop_event.is_set():
-        data = api("/logs")
+        data = api(base, "/logs")
         if data and "lines" in data:
-            lines = data["lines"]
-            for line in lines[shown:]:
+            for line in data["lines"][shown:]:
                 print(f"[host] {line}")
-            shown = len(lines)
+            shown = len(data["lines"])
         time.sleep(1.0)
 
 
 def main():
-    print(f"Connecting to {BASE} ...")
-
-    status = api("/status")
-    if status is None:
-        print("Could not reach the host. Is camera_server.py running, and do")
-        print("HOST_IP / USERNAME / PASSWORD match? Same Wi-Fi network?")
+    print("Searching the network for the camera host...")
+    found = discover_host()
+    if not found:
+        print("No host answered. Is camera_server.py running on this network?")
+        print("(Both devices must be on the same Wi-Fi / LAN.)")
         return
 
+    ip, port = found
+    base = f"http://{ip}:{port}"
+    stream_url = f"http://{USERNAME}:{PASSWORD}@{ip}:{port}/video"
+    print(f"Found the host at {ip}:{port}")
+
+    status = api(base, "/status")
+    if status is None:
+        print("Found the host but couldn't reach its control API.")
+        return
     if status.get("active"):
         print("Host camera is already ON.")
     else:
         print("Host camera is OFF -> turning it ON...")
-        api("/start")
+        api(base, "/start")
 
-    # Background thread: mirror the host's log lines onto this laptop.
     stop_event = threading.Event()
-    log_thread = threading.Thread(
-        target=stream_host_logs, args=(stop_event,), daemon=True
-    )
-    log_thread.start()
+    threading.Thread(
+        target=stream_host_logs, args=(base, stop_event), daemon=True
+    ).start()
 
-    stream = cv2.VideoCapture(STREAM_URL)
+    stream = cv2.VideoCapture(stream_url)
     if not stream.isOpened():
-        print("Reached the host but couldn't open the video stream.")
+        print("Couldn't open the video stream.")
         stop_event.set()
         return
 
     print("Live. Keys:  q = quit + shut camera off   |   l = quit, leave it on")
-
-    shut_down_on_exit = False
+    shut_down = False
     while True:
-        success, frame = stream.read()
-        if not success:
-            print("Stream ended (camera turned off, or host stopped).")
+        ok, frame = stream.read()
+        if not ok:
+            print("Stream ended.")
             break
-
-        cv2.imshow("Room Cam (laptop viewer)", frame)
-
+        cv2.imshow("Room Cam (auto-discovered)", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
-            shut_down_on_exit = True
+            shut_down = True
             break
         if key == ord("l"):
             break
 
-    # Clean up the viewer side.
     stop_event.set()
     stream.release()
     cv2.destroyAllWindows()
-
-    if shut_down_on_exit:
+    if shut_down:
         print("Turning host camera OFF...")
-        api("/stop")
-
+        api(base, "/stop")
     print("Viewer closed.")
 
 
