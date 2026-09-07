@@ -495,10 +495,14 @@ def logs():
 def open_public_tunnel(port):
     """Open a Cloudflare quick tunnel and return the public https URL, or None.
     Quick tunnels need NO account and NO token."""
+    # Catch Exception, not just ImportError: a PyInstaller build that misses
+    # pycloudflared's bundled data files fails here with FileNotFoundError,
+    # which used to kill this thread outright and leave the host running with
+    # no tunnel and no explanation.
     try:
         from pycloudflared import try_cloudflare
-    except ImportError:
-        log("pycloudflared not installed -> local only. `pip install pycloudflared`")
+    except Exception as exc:  # noqa: BLE001
+        log(f"pycloudflared unavailable: {exc}")
         return None
     try:
         return try_cloudflare(port=port).tunnel
@@ -528,9 +532,20 @@ def publish_url_to_mailbox(url):
 
 
 def _startup_tunnel_and_publish():
-    public_url = open_public_tunnel(PORT)
+    try:
+        public_url = open_public_tunnel(PORT)
+    except Exception:  # noqa: BLE001 - a dead thread here must not be silent
+        public_url = None
+        log(f"Tunnel thread failed:\n{traceback.format_exc()}")
     if not public_url:
         log("No public tunnel -> serving on the local network only.")
+        report_fatal(
+            "The internet tunnel could not be opened, so there is no public "
+            "address for this camera.\n\nThe camera is still reachable on your "
+            f"local network at port {PORT}.",
+            "\n".join(LOG_BUFFER),
+            title="Room Cam Web: no public address",
+        )
         return
     log(f"PUBLIC url: {public_url}  (log in {USERNAME} / {PASSWORD})")
     while True:
@@ -555,12 +570,13 @@ def _has_console():
     return sys.stdin is not None and sys.stdin.isatty()
 
 
-def report_fatal(summary, detail=""):
-    """Make a startup failure visible.
+def report_fatal(summary, detail="", title="Room Cam Web could not start"):
+    """Make a failure visible.
 
-    The host is built with --noconsole, so a crash has nowhere to print and the
-    window simply vanishes -- which is exactly what a bad config used to look
-    like. Write the details to a log beside the exe and pop up a dialog.
+    The host is built with --noconsole, so a problem has nowhere to print and
+    the app just sits there doing nothing -- which is exactly what a broken
+    tunnel or a bad config used to look like. Write the details to a log beside
+    the exe and pop up a dialog.
     """
     path = os.path.join(os.path.dirname(_config_path()), "roomcam_error.log")
     stamp = f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}"
@@ -577,8 +593,7 @@ def report_fatal(summary, detail=""):
             root = tk.Tk()
             root.withdraw()
             messagebox.showerror(
-                "Room Cam Web could not start",
-                f"{summary}\n\nFull details were saved to:\n{path}",
+                title, f"{summary}\n\nFull details were saved to:\n{path}"
             )
             root.destroy()
         except Exception:  # noqa: BLE001
