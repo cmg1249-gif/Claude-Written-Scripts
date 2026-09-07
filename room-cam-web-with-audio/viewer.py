@@ -125,7 +125,8 @@ def _config_file():
 
 def load_settings():
     """topic / username / password: env var -> .ini -> prompt -> default."""
-    cfg = configparser.ConfigParser()
+    # interpolation=None so a password containing "%" reads back intact.
+    cfg = configparser.ConfigParser(interpolation=None)
     path = _config_file()
     if os.path.exists(path):
         cfg.read(path)

@@ -32,6 +32,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 from collections import deque
 
@@ -550,10 +551,44 @@ def _config_path():
     return os.path.join(base, CONFIG_FILENAME)
 
 
+def _has_console():
+    return sys.stdin is not None and sys.stdin.isatty()
+
+
+def report_fatal(summary, detail=""):
+    """Make a startup failure visible.
+
+    The host is built with --noconsole, so a crash has nowhere to print and the
+    window simply vanishes -- which is exactly what a bad config used to look
+    like. Write the details to a log beside the exe and pop up a dialog.
+    """
+    path = os.path.join(os.path.dirname(_config_path()), "roomcam_error.log")
+    stamp = f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}"
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {stamp} =====\n{summary}\n{detail}\n")
+    except OSError:
+        path = "(could not write a log file)"
+    print(f"{summary}\n{detail}")
+    if not _has_console():
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "Room Cam Web could not start",
+                f"{summary}\n\nFull details were saved to:\n{path}",
+            )
+            root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _ask(prompt_text, default):
     """Console prompt when there is a console, a pop-up for the no-console
     exe, else the default."""
-    if sys.stdin is not None and sys.stdin.isatty():
+    if _has_console():
         try:
             return input(f"{prompt_text} [{default}]: ").strip() or default
         except EOFError:
@@ -575,7 +610,10 @@ def _ask(prompt_text, default):
 def load_config():
     """env var -> .ini -> first-run prompt -> default; then write the .ini."""
     path = _config_path()
-    cfg = configparser.ConfigParser()
+    # interpolation=None: without it, configparser treats "%" as a variable
+    # reference, so a password containing one raises ValueError on write and
+    # on the next read. That crashed the no-console exe with no visible error.
+    cfg = configparser.ConfigParser(interpolation=None)
     if os.path.exists(path):
         cfg.read(path)
     if not cfg.has_section(CONFIG_SECTION):
@@ -619,19 +657,36 @@ def load_config():
     return values
 
 
-if __name__ == "__main__":
+def _setting(cfg, key, convert, label):
+    """Read one setting, and say which setting is wrong rather than dying with
+    a bare ValueError the user can't act on."""
+    raw = str(cfg[key]).strip()
+    try:
+        return convert(raw)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"The '{key}' setting in {_config_path()} is '{raw}', which is not "
+            f"{label}. Fix that line (or delete the file to start fresh)."
+        )
+
+
+def main():
+    global USERNAME, PASSWORD, NTFY_TOPIC, PORT, CAMERA_INDEX, MIC_DEVICE
+    global SAMPLE_RATE, ENABLE_TUNNEL, VIDEO_FPS, JPEG_QUALITY, VIDEO_WIDTH
+
     _cfg = load_config()
     USERNAME = _cfg["username"]
     PASSWORD = _cfg["password"]
     NTFY_TOPIC = _cfg["topic"]
-    PORT = int(_cfg["port"])
-    CAMERA_INDEX = int(_cfg["camera_index"])
-    MIC_DEVICE = int(_cfg["mic_device"]) if str(_cfg["mic_device"]).strip() else None
-    SAMPLE_RATE = int(_cfg["audio_rate"])
+    PORT = _setting(_cfg, "port", int, "a whole number")
+    CAMERA_INDEX = _setting(_cfg, "camera_index", int, "a whole number")
+    MIC_DEVICE = _setting(_cfg, "mic_device", int, "a whole number") \
+        if str(_cfg["mic_device"]).strip() else None
+    SAMPLE_RATE = _setting(_cfg, "audio_rate", int, "a whole number")
     ENABLE_TUNNEL = str(_cfg["tunnel"]).strip().lower() in ("1", "yes", "true", "on")
-    VIDEO_FPS = float(_cfg["video_fps"])
-    JPEG_QUALITY = int(_cfg["jpeg_quality"])
-    VIDEO_WIDTH = int(_cfg["video_width"])
+    VIDEO_FPS = _setting(_cfg, "video_fps", float, "a number")
+    JPEG_QUALITY = _setting(_cfg, "jpeg_quality", int, "a whole number")
+    VIDEO_WIDTH = _setting(_cfg, "video_width", int, "a whole number")
 
     log("Room Cam Web with Audio starting. Camera + mic OFF until a viewer connects.")
     log(f"Config file: {_config_path()}")
@@ -645,4 +700,32 @@ if __name__ == "__main__":
     else:
         log("Tunnel disabled in config -> local network only.")
 
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    try:
+        app.run(host="0.0.0.0", port=PORT, threaded=True)
+    except OSError as exc:
+        # WSAEADDRINUSE on Windows, EADDRINUSE on Linux.
+        if getattr(exc, "winerror", None) == 10048 or getattr(exc, "errno", None) in (48, 98):
+            raise SystemExit(
+                f"Port {PORT} is already in use, so the server could not start.\n\n"
+                "Another copy of Room Cam is probably already running -- check "
+                "Task Manager for webcam_server.exe and end it, or set a "
+                f"different 'port' in {_config_path()}."
+            )
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except SystemExit as exc:          # our own friendly messages
+        if exc.code not in (0, None):
+            report_fatal(str(exc.code))
+            sys.exit(1)
+    except BaseException:              # noqa: BLE001 - last resort, must be seen
+        report_fatal(
+            "Room Cam Web hit an unexpected error and stopped.",
+            traceback.format_exc(),
+        )
+        sys.exit(1)

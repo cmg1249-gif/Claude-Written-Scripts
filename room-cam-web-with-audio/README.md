@@ -117,6 +117,12 @@ The viewer reads `topic`, `username`, `password` from the same file or env vars.
   `*.trycloudflare.com` names. The viewer works around it automatically. A
   **browser** on that same network will fail to open the page, though; either
   use `viewer.py`, use a phone on cellular, or set the PC's DNS to `1.1.1.1`.
+- **The host asks for a password, then the window just closes.** Fixed in
+  v1.0.1. Older builds crashed if the password contained a `%`. If a host still
+  closes on startup, look for `roomcam_error.log` next to the exe; from v1.0.1
+  on, every startup failure is written there and shown in a dialog.
+- **Forgot the password, or want to start over.** Delete `roomcam_config.ini`
+  next to the exe. The next run asks again.
 - **No audio, video fine.** Check the host log for "Mic could not start" and
   set `mic_device` in `roomcam_config.ini` to the right index.
 
