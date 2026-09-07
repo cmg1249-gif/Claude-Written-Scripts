@@ -686,6 +686,18 @@ class Recorder:
         self.t0 = 0.0
         self._vpath = self._apath = self._base = None
 
+    def _unique_base(self, stamp):
+        """`roomcam_<stamp>`, bumped to `_2`, `_3`... if a file of that name
+        already exists. Second-resolution stamps collide when two recordings
+        start in the same second (e.g. a mic-rate rollover), which would
+        otherwise overwrite the first file."""
+        base = f"roomcam_{stamp}"
+        cand, n = base, 2
+        while any(os.path.exists(os.path.join(self.out_dir, cand + ext))
+                  for ext in (f".{self.fmt}", ".video.avi", ".audio.wav")):
+            cand, n = f"{base}_{n}", n + 1
+        return cand
+
     def start(self, frame, rate, channels):
         """main thread: open the temp writers sized to the current frame."""
         with self._lock:
@@ -693,7 +705,7 @@ class Recorder:
                 return
             h, w = frame.shape[:2]
             stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._base = f"roomcam_{stamp}"
+            self._base = self._unique_base(stamp)
             self._vpath = os.path.join(self.out_dir, self._base + ".video.avi")
             self._apath = os.path.join(self.out_dir, self._base + ".audio.wav")
             vw = cv2.VideoWriter(
@@ -743,6 +755,22 @@ class Recorder:
             return None
         self.start(frame, rate, channels)
         return None
+
+    def handle_rate_change(self, new_rate, frame, channels):
+        """A different host mic can run at a different sample rate, but a WAV's
+        rate is fixed once it's open. If we're recording when the rate changes,
+        finish the current file and immediately start a fresh one at the new
+        rate, so recording continues in sync (split into two files at the
+        switch). No-op when not recording or the rate is unchanged."""
+        if not self.recording or new_rate == self.rate:
+            return
+        print(f"[viewer] mic rate {self.rate}->{new_rate} Hz while recording; "
+              "saving the current file and continuing in a new one.")
+        self.stop()
+        if frame is not None:
+            self.start(frame, new_rate, channels)
+        else:
+            print("[viewer] no frame to resume on -- recording stopped.")
 
     def stop(self):
         """Close the writers, then mux. Returns the saved path (or the kept
@@ -1030,6 +1058,7 @@ def main():
                 if reply and reply.get("sample_rate") and reply["sample_rate"] != clock.rate:
                     new_rate = int(reply["sample_rate"])
                     print(f"[viewer] that mic runs at {new_rate} Hz; reopening the speaker.")
+                    recorder.handle_rate_change(new_rate, ui["frame"], channels)
                     clock.set_rate(new_rate)
                     if speaker is not None:
                         speaker.stop(); speaker.close()

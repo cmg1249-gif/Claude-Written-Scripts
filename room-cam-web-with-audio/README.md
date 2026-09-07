@@ -1,5 +1,13 @@
 # Room Cam Web with Audio
 
+> ⚠️ **Proof of concept — for learning and authorized use only.** This is a
+> personal project built to explore webcam/mic streaming, tunneling, and A/V
+> sync. It is **not** hardened for production and must **never** be used to
+> watch, listen to, or record anyone without their clear knowledge and consent.
+> Only ever point it at a device **you own** or have explicit permission to use.
+> Covert surveillance is illegal in most places and is not what this tool is
+> for. Use it responsibly, on yourself and your own equipment.
+
 [Room Cam Web](../room-cam-web) v2.0 plus the host's **microphone**. Watch and
 listen from **anywhere on the internet** with **no accounts and no tokens** on
 either side. Settings are promptable, so you never edit code.
@@ -87,6 +95,11 @@ codecs), or `avi` (MJPEG + PCM — larger, but no re-encoding of the video).
 Video length is tied to the audio, which is the same master clock playback uses,
 so the recording stays in sync even when the tunnel delivers frames unevenly.
 
+If you switch the host to a mic with a **different sample rate** (`n`) while
+recording, the current file is finished off and a fresh one is started at the
+new rate automatically — the recording carries on, split into two files at the
+switch, each in sync.
+
 `python viewer.py --browser` opens the page in your browser instead (the old
 v2.0 behaviour). Use the **Listen** and **Mic** buttons there.
 
@@ -172,8 +185,11 @@ The viewer reads `topic`, `username`, `password` from the same file or env vars.
 
 ## ⚠️ Security — read this
 
-This puts your webcam **and microphone** on the public internet behind a
-single password.
+This is a **proof of concept**, and it puts your webcam **and microphone** on
+the public internet behind a single password. Use it only on hardware you own
+or are authorized to use, and only with the knowledge and consent of anyone it
+can see or hear. Do not use it to surveil people — that is illegal in most
+places and is not the point of this project.
 
 - **Set a real password** at the first-run prompt. `1337` is a public demo value.
 - The **ntfy topic is public**. Anyone who knows it can read the current tunnel
