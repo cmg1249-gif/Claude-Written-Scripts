@@ -31,6 +31,7 @@ import configparser
 import getpass
 import json
 import os
+import random
 import socket
 import struct
 import sys
@@ -58,23 +59,68 @@ CONFIG_SECTION = "roomcam"
 # the normal resolver fails, ask Cloudflare's resolver directly over HTTPS by
 # IP address, so the viewer works on those networks with no settings changed.
 _real_getaddrinfo = socket.getaddrinfo
-_doh_cache = {}
+_dns_cache = {}
+PUBLIC_RESOLVERS = ("1.1.1.1", "8.8.8.8", "9.9.9.9")
 
 
-def _doh_lookup(hostname):
-    for resolver_ip in ("1.1.1.1", "1.0.0.1"):
-        try:
-            req = urllib.request.Request(
-                f"https://{resolver_ip}/dns-query?name={hostname}&type=A",
-                headers={"Accept": "application/dns-json"},
-            )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                answer = json.loads(resp.read().decode())
-            ips = [a["data"] for a in answer.get("Answer", []) if a.get("type") == 1]
-            if ips:
-                return ips
-        except Exception:  # noqa: BLE001
-            continue
+def _skip_dns_name(data, i):
+    """Step over a name in a DNS message, following compression pointers."""
+    while i < len(data):
+        length = data[i]
+        if length == 0:
+            return i + 1
+        if length & 0xC0 == 0xC0:       # pointer: two bytes, and it ends here
+            return i + 2
+        i += length + 1
+    return i
+
+
+def _dns_query(hostname, server, timeout=4):
+    """Ask a public resolver directly over UDP and return its A records.
+
+    Plain UDP on purpose. DNS-over-HTTPS to a bare resolver IP fails
+    certificate validation on this setup, and resolving the DoH server by name
+    would need the very lookup we are trying to replace.
+    """
+    labels = b"".join(
+        bytes([len(p)]) + p.encode() for p in hostname.split(".") if p
+    ) + b"\x00"
+    query_id = random.randint(0, 0xFFFF)
+    packet = (struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0)
+              + labels + struct.pack("!HH", 1, 1))     # QTYPE=A, QCLASS=IN
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(packet, (server, 53))
+        data, _ = sock.recvfrom(4096)
+    except OSError:
+        return []
+    finally:
+        sock.close()
+
+    if len(data) < 12 or struct.unpack("!H", data[:2])[0] != query_id:
+        return []
+    answer_count = struct.unpack("!H", data[6:8])[0]
+    i = _skip_dns_name(data, 12) + 4                   # question name + type/class
+    ips = []
+    for _ in range(answer_count):
+        i = _skip_dns_name(data, i)
+        if i + 10 > len(data):
+            break
+        rtype, _rclass, _ttl, rdlength = struct.unpack("!HHIH", data[i:i + 10])
+        i += 10
+        if rtype == 1 and rdlength == 4:               # an A record
+            ips.append(".".join(str(b) for b in data[i:i + 4]))
+        i += rdlength
+    return ips
+
+
+def _public_dns_lookup(hostname):
+    for resolver in PUBLIC_RESOLVERS:
+        ips = _dns_query(hostname, resolver)
+        if ips:
+            return ips
     return []
 
 
@@ -82,14 +128,17 @@ def _getaddrinfo_with_fallback(host, port, family=0, type=0, proto=0, flags=0):
     try:
         return _real_getaddrinfo(host, port, family, type, proto, flags)
     except socket.gaierror:
-        if host not in _doh_cache:
-            ips = _doh_lookup(host)
+        if host not in _dns_cache:
+            ips = _public_dns_lookup(host)
             if not ips:
+                print(f"[viewer] {host} could not be resolved, by your network's "
+                      "DNS or by a public one.")
                 raise
-            _doh_cache[host] = ips
-            print(f"[viewer] your DNS could not resolve {host}; using Cloudflare DNS instead.")
+            _dns_cache[host] = ips
+            print(f"[viewer] your network's DNS refused to resolve {host}; "
+                  f"using a public resolver instead ({ips[0]}).")
         socktype = type or socket.SOCK_STREAM
-        return [(socket.AF_INET, socktype, 0, "", (ip, port)) for ip in _doh_cache[host]]
+        return [(socket.AF_INET, socktype, 0, "", (ip, port)) for ip in _dns_cache[host]]
 
 
 socket.getaddrinfo = _getaddrinfo_with_fallback
@@ -310,6 +359,25 @@ class AudioClock:
     def reset(self):
         with self._lock:
             self._last_seq = None
+
+    def set_rate(self, rate):
+        """A different microphone may run at a different sample rate. The
+        reader thread keeps this same object, so change it in place."""
+        with self._lock:
+            self.rate = rate
+            self._buf.clear()
+            self.primed = False
+            self._last_seq = None
+
+    def relax(self):
+        """Give latency back once the link settles. The buffer only ever grew
+        before, so a rough first half-minute meant seconds of delay for the
+        rest of the session."""
+        floor = max(PREBUFFER_SECONDS, self.max_gap * 2 + 0.2)
+        if self.prebuffer > floor + 0.05:
+            self.prebuffer = max(floor, self.prebuffer * 0.8)
+            return True
+        return False
 
     def pull(self, nbytes):
         with self._lock:
@@ -578,17 +646,22 @@ def main():
         nbytes = frames_n * 2 * channels
         outdata[:] = np.frombuffer(clock.pull(nbytes), dtype=DTYPE).reshape(frames_n, channels)
 
-    speaker = None
-    try:
-        speaker = sd.OutputStream(
-            samplerate=rate, channels=channels, dtype=DTYPE,
-            blocksize=int(rate * 0.04), device=args.device,
-            callback=speaker_callback,
-        )
-        speaker.start()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[viewer] no speaker output ({exc}); video only.")
-        speaker = None
+    def _open_speaker(rate_hz, chans, device):
+        """Open the speaker at a given rate. Reopened if a different mic is
+        picked, since a stream's sample rate is fixed once it starts."""
+        try:
+            stream = sd.OutputStream(
+                samplerate=rate_hz, channels=chans, dtype=DTYPE,
+                blocksize=int(rate_hz * 0.04), device=device,
+                callback=speaker_callback,
+            )
+            stream.start()
+            return stream
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewer] no speaker output ({exc}); video only.")
+            return None
+
+    speaker = _open_speaker(rate, channels, args.device)
 
     threading.Thread(
         target=audio_reader, args=(host, clock, wav, stop_event), daemon=True
@@ -605,12 +678,27 @@ def main():
         args=(host, frames, frames_lock, stop_event, counters), daemon=True,
     ).start()
 
-    print("Live. Keys:  m = mic on/off  |  q = quit + all off  |  l = quit, leave on")
+    device_info = host.api("/devices", quiet=True) or {}
+    cameras = [c["index"] for c in device_info.get("cameras", [])]
+    mics = [-1] + [m["index"] for m in device_info.get("microphones", [])]
+    mic_names = {m["index"]: m["name"] for m in device_info.get("microphones", [])}
+    mic_names[-1] = "default microphone"
+    if cameras:
+        print(f"Cameras on the host: {', '.join('Camera ' + str(c) for c in cameras)}")
+    if len(mics) > 1:
+        print(f"Microphones on the host: {len(mics) - 1} found")
+
+    print("Live. Keys:  m = mic on/off  |  c = next camera  |  n = next mic")
+    print("             q = quit + all off  |  l = quit, leave on")
     shut_down = False
     started = time.monotonic()
     last_report = started
     window = "Room Cam Web with Audio"
     lag_tracker = VideoLagTracker(clock)
+    current_cam = device_info.get("current_camera", 0)
+    cam_pos = cameras.index(current_cam) if current_cam in cameras else 0
+    current_mic = device_info.get("current_mic", -1)
+    mic_pos = mics.index(current_mic) if current_mic in mics else 0
     try:
         while True:
             if args.seconds and time.monotonic() - started >= args.seconds:
@@ -644,10 +732,28 @@ def main():
                     host.api("/mic/start")
                     mic_on = True
                     print("[viewer] host mic ON")
+            if key == ord("c") and len(cameras) > 1:
+                cam_pos = (cam_pos + 1) % len(cameras)
+                reply = host.api(f"/camera/select?index={cameras[cam_pos]}")
+                print(f"[viewer] host camera -> Camera {cameras[cam_pos]}"
+                      + ("" if reply and reply.get("ok") else "  (it did not open)"))
+            if key == ord("n") and len(mics) > 1:
+                mic_pos = (mic_pos + 1) % len(mics)
+                reply = host.api(f"/mic/select?index={mics[mic_pos]}")
+                print(f"[viewer] host mic -> {mic_names.get(mics[mic_pos], mics[mic_pos])}")
+                if reply and reply.get("sample_rate") and reply["sample_rate"] != clock.rate:
+                    new_rate = int(reply["sample_rate"])
+                    print(f"[viewer] that mic runs at {new_rate} Hz; reopening the speaker.")
+                    clock.set_rate(new_rate)
+                    if speaker is not None:
+                        speaker.stop(); speaker.close()
+                        speaker = _open_speaker(new_rate, channels, args.device)
+                mic_on = bool(reply and reply.get("mic"))
 
             now = time.monotonic()
             if now - last_report >= 5.0:
                 last_report = now
+                clock.relax()
                 synced = counters["shown_synced"]
                 avg = (counters["sync_error_sum"] / synced * 1000) if synced else 0
                 print(

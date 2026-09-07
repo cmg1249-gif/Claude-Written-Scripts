@@ -71,11 +71,21 @@ DEFAULT_MIC_DEVICE = ""        # "" = default mic; or an index from `python -m s
 DEFAULT_AUDIO_RATE = 16000     # 16 kHz mono = voice quality, ~256 kbit/s upload
 DEFAULT_TUNNEL = "yes"         # "no" = LAN only (skip Cloudflare + ntfy)
 # Video over the internet must fit your UPLOAD speed or it queues up and lags
-# seconds behind the audio. 640 px wide at 20 fps / quality 70 is ~3 Mbit/s;
-# 30 fps / quality 80 is ~6 Mbit/s. Raise these only if your upload is fast.
-DEFAULT_VIDEO_FPS = 20
-DEFAULT_JPEG_QUALITY = 70
-DEFAULT_VIDEO_WIDTH = 640      # 0 = camera's native width
+# seconds behind the audio. Measured at 640x480: quality 80 costs about
+# 9 Mbit/s at 30 fps. Capturing at 1280x720 instead triples that to roughly
+# 30 Mbit/s, which is why the capture size is left at the camera's default.
+DEFAULT_VIDEO_FPS = 30
+DEFAULT_JPEG_QUALITY = 80
+DEFAULT_VIDEO_WIDTH = 640      # scale frames down to this width; 0 = no scaling
+DEFAULT_CAPTURE_WIDTH = 0      # ask the camera for this size; 0 = its default
+DEFAULT_CAPTURE_HEIGHT = 0     # both must be set to take effect
+# video_fps and jpeg_quality are a CEILING, not a demand. With adaptive on,
+# the host measures what it is actually achieving and backs off when the
+# camera, the CPU or the uplink cannot keep up -- so the same settings work
+# on a slow laptop as on a fast desktop. Set it to "no" to pin the values.
+DEFAULT_ADAPTIVE = "yes"
+MIN_FPS = 5                    # never drop below this
+MIN_QUALITY = 40               # nor below this
 
 # Filled in from config in __main__; functions read these globals at call time.
 USERNAME = DEFAULT_USERNAME
@@ -89,6 +99,9 @@ ENABLE_TUNNEL = True
 VIDEO_FPS = DEFAULT_VIDEO_FPS
 JPEG_QUALITY = DEFAULT_JPEG_QUALITY
 VIDEO_WIDTH = DEFAULT_VIDEO_WIDTH
+CAPTURE_WIDTH = DEFAULT_CAPTURE_WIDTH
+CAPTURE_HEIGHT = DEFAULT_CAPTURE_HEIGHT
+ADAPTIVE = True
 
 # ---- Fixed knobs (rarely changed) ------------------------------------------
 REOPEN_AFTER_FAILURES = 30
@@ -107,6 +120,11 @@ app = Flask(__name__)
 
 camera = None
 camera_lock = threading.Lock()
+# Whether a viewer WANTS video, as opposed to whether a camera is open right
+# now. Selecting a camera that fails to open must not silently turn video off
+# for good -- picking a working one afterwards has to bring it back.
+camera_wanted = False
+mic_wanted = False
 
 mic_stream = None
 mic_lock = threading.Lock()
@@ -147,13 +165,25 @@ _werkzeug_log.addFilter(_DropPolling())
 
 # ---- Camera ----------------------------------------------------------------
 def start_camera():
+    """Turn the camera on. Returns False if there is no camera to turn on --
+    a host with only a microphone is a perfectly good host."""
     global camera
     with camera_lock:
-        if camera is None:
-            camera = cv2.VideoCapture(CAMERA_INDEX)
-            log("Camera turned ON.")
-            return True
-        return False
+        if camera is not None:
+            return False
+        cam = cv2.VideoCapture(CAMERA_INDEX)
+        if not cam.isOpened():
+            cam.release()
+            log(f"No camera at index {CAMERA_INDEX}; serving without video.")
+            return False
+        if CAPTURE_WIDTH and CAPTURE_HEIGHT:
+            cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+            cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+        camera = cam
+        log("Camera turned ON ({}x{}).".format(
+            int(cam.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT))))
+        return True
 
 
 def stop_camera():
@@ -258,27 +288,38 @@ def require_login():
 # ---- Streams ---------------------------------------------------------------
 def generate_frames():
     """MJPEG stream. Each part carries X-Timestamp (host clock) and
-    Content-Length so viewer.py can line frames up with the audio."""
+    Content-Length so viewer.py can line frames up with the audio.
+
+    The send rate adapts. VIDEO_FPS and JPEG_QUALITY are the ceiling; every
+    few seconds we compare what we actually delivered against what we aimed
+    for, and step down when the camera, the CPU or the uplink cannot keep up.
+    Yielding a frame blocks until the client has taken it, so a slow viewer
+    shows up here as a low achieved rate -- which is exactly the signal we
+    want. When the pressure lifts we climb back toward the ceiling.
+    """
     global camera
     consecutive_failures = 0
-    frame_interval = 1.0 / VIDEO_FPS if VIDEO_FPS > 0 else 0.0
+    target_fps = float(VIDEO_FPS) if VIDEO_FPS > 0 else 0.0
+    quality = JPEG_QUALITY
     next_frame_at = time.monotonic()
+    window_start = time.monotonic()
+    window_frames = 0
+    good_windows = 0
+    lean_windows = 0
+    first_window = True
+
     while True:
         cam = camera
         if cam is None:
             break
         try:
-            # Pace to VIDEO_FPS. The camera still runs at its own rate; we just
-            # read (and discard) frames until it's time to send one, so what
-            # we send is always the freshest frame, not a stale queued one.
+            # Read every frame the camera offers but only SEND on schedule, so
+            # what goes out is always the freshest frame, never a stale queued
+            # one. Reading and discarding is far cheaper than encoding.
             success, frame = cam.read()
             captured_at = time.monotonic()
-            if success and frame_interval and captured_at < next_frame_at:
-                continue
-            next_frame_at = max(next_frame_at + frame_interval, captured_at)
-            if success and VIDEO_WIDTH and frame.shape[1] > VIDEO_WIDTH:
-                new_h = int(frame.shape[0] * VIDEO_WIDTH / frame.shape[1])
-                frame = cv2.resize(frame, (VIDEO_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+            frame_interval = 1.0 / target_fps if target_fps > 0 else 0.0
+
             if not success:
                 consecutive_failures += 1
                 time.sleep(0.1)
@@ -292,17 +333,27 @@ def generate_frames():
                 continue
             consecutive_failures = 0
 
+            if frame_interval and captured_at < next_frame_at:
+                continue
+            next_frame_at = max(next_frame_at + frame_interval, captured_at)
+
+            if VIDEO_WIDTH and frame.shape[1] > VIDEO_WIDTH:
+                new_h = int(frame.shape[0] * VIDEO_WIDTH / frame.shape[1])
+                frame = cv2.resize(frame, (VIDEO_WIDTH, new_h),
+                                   interpolation=cv2.INTER_AREA)
+
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cv2.putText(
                 frame, timestamp, (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,
             )
             ok, buffer = cv2.imencode(
-                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality]
             )
             if not ok:
                 continue
             jpeg = buffer.tobytes()
+
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n"
@@ -310,6 +361,49 @@ def generate_frames():
                 + f"Content-Length: {len(jpeg)}\r\n\r\n".encode()
                 + jpeg + b"\r\n"
             )
+            window_frames += 1
+
+            # ---- adapt ------------------------------------------------------
+            if not ADAPTIVE or target_fps <= 0:
+                continue
+            elapsed = time.monotonic() - window_start
+            if elapsed < 3.0:
+                continue
+            achieved = window_frames / elapsed
+            window_start = time.monotonic()
+            window_frames = 0
+
+            if first_window:
+                # Cameras take a moment to hand over their first frames, and
+                # judging the link on that would collapse the rate instantly.
+                first_window = False
+                continue
+
+            if achieved < target_fps * 0.8:
+                good_windows = 0
+                lean_windows += 1
+                if target_fps > MIN_FPS:
+                    target_fps = max(MIN_FPS, min(float(VIDEO_FPS), achieved * 0.95))
+                    log(f"Only managing {achieved:.1f} fps; aiming for "
+                        f"{target_fps:.1f} instead.")
+                elif quality > MIN_QUALITY and lean_windows >= 2:
+                    # Already as slow as we go, so make each frame smaller.
+                    # Two windows in a row, so one hiccup does not cost quality.
+                    quality = max(MIN_QUALITY, quality - 10)
+                    log(f"Still behind at {achieved:.1f} fps; "
+                        f"dropping quality to {quality}.")
+            elif achieved >= target_fps * 0.95:
+                lean_windows = 0
+                good_windows += 1
+                if good_windows >= 3 and (target_fps < VIDEO_FPS or quality < JPEG_QUALITY):
+                    good_windows = 0
+                    if quality < JPEG_QUALITY:
+                        quality = min(JPEG_QUALITY, quality + 10)
+                        log(f"Link has room; quality back up to {quality}.")
+                    else:
+                        target_fps = min(float(VIDEO_FPS), target_fps * 1.25)
+                        log(f"Link has room; aiming for {target_fps:.1f} fps.")
+
         except Exception as exc:  # noqa: BLE001
             log(f"[frame error] {exc}")
             time.sleep(0.1)
@@ -354,6 +448,9 @@ INDEX_HTML = """<!doctype html>
              border-radius:6px; padding:8px 14px; font-size:.95rem; }
     button.on { border-color:#8f8; color:#8f8; }
     #st { font-size:.8rem; color:#888; padding-bottom:10px; }
+    select { background:#1c1c22; color:#ddd; border:1px solid #444;
+             border-radius:6px; padding:7px 10px; font-size:.9rem;
+             max-width:44vw; }
   </style>
 </head>
 <body>
@@ -362,6 +459,10 @@ INDEX_HTML = """<!doctype html>
   <div class="bar">
     <button id="listen">&#128264; Listen</button>
     <button id="mic">&#127908; Mic: ?</button>
+  </div>
+  <div class="bar">
+    <select id="camsel" title="Camera"></select>
+    <select id="micsel" title="Microphone"></select>
   </div>
   <div id="st"></div>
 <script>
@@ -435,6 +536,43 @@ async function listen() {
   listening = false; listenBtn.textContent = '\\u{1F508} Listen'; listenBtn.className='';
 }
 listenBtn.onclick = listen; micBtn.onclick = toggleMic;
+
+// Device pickers. The camera list is by index because OpenCV cannot name
+// cameras; microphones report their real names.
+const camSel = document.getElementById('camsel');
+const micSel = document.getElementById('micsel');
+function opt(value, label, selected) {
+  const o = document.createElement('option');
+  o.value = value; o.textContent = label; o.selected = selected;
+  return o;
+}
+async function loadDevices() {
+  try {
+    const d = await (await fetch(u('/devices'))).json();
+    camSel.replaceChildren(...d.cameras.map(c => opt(c.index, c.name, c.index === d.current_camera)));
+    if (!d.cameras.length) camSel.replaceChildren(opt(-1, 'No camera found', true));
+    micSel.replaceChildren(opt(-1, 'Default microphone', d.current_mic === -1),
+      ...d.microphones.map(m => opt(m.index, m.name, m.index === d.current_mic)));
+  } catch (e) { st.textContent = 'could not list devices: ' + e; }
+}
+camSel.onchange = async () => {
+  await fetch(u('/camera/select?index=' + camSel.value), {method: 'POST'});
+  // the old MJPEG stream ended with the old camera, so ask for a new one
+  const img = document.querySelector('img');
+  img.src = u('/video') + '?t=' + Date.now();
+};
+micSel.onchange = async () => {
+  const r = await fetch(u('/mic/select?index=' + micSel.value), {method: 'POST'});
+  const j = await r.json();
+  if (j.sample_rate && j.sample_rate !== rate) {
+    // The audio context is fixed to one rate, so rebuild it for the new mic.
+    rate = j.sample_rate;
+    if (listening) { await listen(); ctx = null; nextTime = 0; await listen(); }
+    else { ctx = null; }
+  }
+  await status();
+};
+loadDevices();
 status(); setInterval(status, 5000);
 </script>
 </body>
@@ -449,7 +587,11 @@ def index():
 
 @app.route("/video")
 def video():
+    global camera_wanted
+    camera_wanted = True
     start_camera()
+    if camera is None:
+        return Response("This host has no camera.", 503)
     return Response(
         generate_frames(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
@@ -471,20 +613,118 @@ def audio():
     )
 
 
+# ---- Device discovery and selection ------------------------------------------
+_camera_probe = None
+
+
+def list_cameras(max_index=4):
+    """Which camera indices actually open. OpenCV gives no portable way to
+    read a camera's name, so they are offered by index. Probing opens each
+    device briefly, so the answer is cached for the life of the process."""
+    global _camera_probe
+    if _camera_probe is not None:
+        return _camera_probe
+    found = []
+    for i in range(max_index + 1):
+        if camera is not None and i == CAMERA_INDEX:
+            found.append(i)              # in use by us, so certainly present
+            continue
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            found.append(i)
+        cap.release()
+    _camera_probe = found
+    return found
+
+
+def list_microphones():
+    """Input devices, limited to the default host API so the list stays short.
+    Windows reports the same microphone once per audio backend."""
+    out = []
+    try:
+        devices_info = sd.query_devices()
+    except Exception as exc:  # noqa: BLE001
+        log(f"Could not list microphones: {exc}")
+        return out
+    try:
+        preferred = sd.default.hostapi
+    except Exception:  # noqa: BLE001
+        preferred = None
+    for idx, dev in enumerate(devices_info):
+        if dev.get("max_input_channels", 0) < 1:
+            continue
+        if preferred is not None and dev.get("hostapi") != preferred and idx != MIC_DEVICE:
+            continue
+        out.append({"index": idx, "name": str(dev.get("name", "Input " + str(idx)))})
+    return out
+
+
+@app.route("/devices")
+def devices():
+    return jsonify(
+        cameras=[{"index": i, "name": "Camera " + str(i)} for i in list_cameras()],
+        microphones=list_microphones(),
+        current_camera=CAMERA_INDEX,
+        current_mic=MIC_DEVICE if MIC_DEVICE is not None else -1,
+    )
+
+
+@app.route("/camera/select", methods=["GET", "POST"])
+def camera_select():
+    """Switch to another camera, restarting it only if it was already on."""
+    global CAMERA_INDEX
+    try:
+        index = int(request.values.get("index"))
+    except (TypeError, ValueError):
+        return jsonify(error="index must be a whole number"), 400
+    was_on = camera is not None or camera_wanted
+    stop_camera()
+    CAMERA_INDEX = index
+    started = start_camera() if was_on else True
+    log("Camera selection set to index " + str(index) + ".")
+    return jsonify(current_camera=CAMERA_INDEX, active=camera is not None,
+                   ok=bool(started))
+
+
+@app.route("/mic/select", methods=["GET", "POST"])
+def mic_select():
+    """Switch to another microphone. -1 or blank means the system default."""
+    global MIC_DEVICE
+    raw = request.values.get("index")
+    try:
+        index = None if raw in (None, "", "-1") else int(raw)
+    except ValueError:
+        return jsonify(error="index must be a whole number"), 400
+    was_on = mic_stream is not None or mic_wanted
+    stop_mic()
+    MIC_DEVICE = index
+    started = start_mic() if was_on else True
+    log("Microphone selection set to " + (str(index) if index is not None else "default") + ".")
+    return jsonify(current_mic=MIC_DEVICE if MIC_DEVICE is not None else -1,
+                   mic=mic_stream is not None, ok=bool(started),
+                   sample_rate=SAMPLE_RATE)
+
+
 @app.route("/start", methods=["GET", "POST"])
 def start():
+    global camera_wanted
+    camera_wanted = True
     changed = start_camera()
     return jsonify(active=camera is not None, changed=changed)
 
 
 @app.route("/stop", methods=["GET", "POST"])
 def stop():
+    global camera_wanted
+    camera_wanted = False
     changed = stop_camera()
     return jsonify(active=camera is not None, changed=changed)
 
 
 @app.route("/mic/start", methods=["GET", "POST"])
 def mic_start():
+    global mic_wanted
+    mic_wanted = True
     changed = start_mic()
     return jsonify(mic=mic_stream is not None, changed=changed,
                    sample_rate=SAMPLE_RATE, channels=CHANNELS)
@@ -492,6 +732,8 @@ def mic_start():
 
 @app.route("/mic/stop", methods=["GET", "POST"])
 def mic_stop():
+    global mic_wanted
+    mic_wanted = False
     changed = stop_mic()
     return jsonify(mic=mic_stream is not None, changed=changed)
 
@@ -662,6 +904,9 @@ def load_config():
         "video_fps": str(DEFAULT_VIDEO_FPS),
         "jpeg_quality": str(DEFAULT_JPEG_QUALITY),
         "video_width": str(DEFAULT_VIDEO_WIDTH),
+        "capture_width": str(DEFAULT_CAPTURE_WIDTH),
+        "capture_height": str(DEFAULT_CAPTURE_HEIGHT),
+        "adaptive": DEFAULT_ADAPTIVE,
     }
     values = {}
     for key, dflt in defaults.items():
@@ -704,6 +949,7 @@ def _setting(cfg, key, convert, label):
 def main():
     global USERNAME, PASSWORD, NTFY_TOPIC, PORT, CAMERA_INDEX, MIC_DEVICE
     global SAMPLE_RATE, ENABLE_TUNNEL, VIDEO_FPS, JPEG_QUALITY, VIDEO_WIDTH
+    global CAPTURE_WIDTH, CAPTURE_HEIGHT, ADAPTIVE
 
     _cfg = load_config()
     USERNAME = _cfg["username"]
@@ -718,6 +964,9 @@ def main():
     VIDEO_FPS = _setting(_cfg, "video_fps", float, "a number")
     JPEG_QUALITY = _setting(_cfg, "jpeg_quality", int, "a whole number")
     VIDEO_WIDTH = _setting(_cfg, "video_width", int, "a whole number")
+    CAPTURE_WIDTH = _setting(_cfg, "capture_width", int, "a whole number")
+    CAPTURE_HEIGHT = _setting(_cfg, "capture_height", int, "a whole number")
+    ADAPTIVE = str(_cfg["adaptive"]).strip().lower() in ("1", "yes", "true", "on")
 
     log("Room Cam Web with Audio starting. Camera + mic OFF until a viewer connects.")
     log(f"Config file: {_config_path()}")

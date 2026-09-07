@@ -58,8 +58,12 @@ password once (or reads it from a `roomcam_config.ini` beside it, or the
 
 Keys (with the video window focused):
 - `m` — toggle the host **mic** on/off
+- `c` — switch to the host's next **camera**
+- `n` — switch to the host's next **microphone**
 - `q` — quit **and** turn the host camera + mic off
 - `l` — quit but leave them running
+
+The web page has dropdowns for the same two things.
 
 `python viewer.py --browser` opens the page in your browser instead (the old
 v2.0 behaviour). Use the **Listen** and **Mic** buttons there.
@@ -75,14 +79,23 @@ v2.0 behaviour). Use the **Listen** and **Mic** buttons there.
 | `mic_device` | *(blank = default)* | which microphone (`python -m sounddevice` lists them) |
 | `audio_rate` | `16000` | mic sample rate; falls back automatically if the mic can't do it |
 | `tunnel` | `yes` | `no` = LAN only, skip Cloudflare + ntfy |
-| `video_fps` | `20` | frames per second sent. 20 fps / quality 70 / 640 px is about 3 Mbit/s of upload |
-| `jpeg_quality` | `70` | 1–100. Higher = sharper and heavier |
-| `video_width` | `640` | frames are scaled down to this width; `0` = camera's native size |
+| `video_fps` | `30` | **ceiling** for frames per second. At 640x480 quality 80 that is about 9 Mbit/s of upload |
+| `jpeg_quality` | `80` | 1–100 ceiling. Higher = sharper and heavier |
+| `video_width` | `640` | frames are scaled down to this width before sending; `0` = no scaling |
+| `capture_width` / `capture_height` | `0` | ask the camera for a specific size; `0` = the camera's default |
+| `adaptive` | `yes` | back off automatically when the machine or the link cannot keep up |
 
-**Video must fit your upload speed.** If it doesn't, frames queue up in the
-tunnel and the picture runs seconds behind the sound (the viewer delays the
-audio to compensate, but it's still lag). Lower `video_fps` or `jpeg_quality`
-if the viewer keeps printing "video is … behind the audio".
+**The fps and quality settings are a ceiling, not a demand.** With `adaptive`
+on, the host measures what it is actually delivering every few seconds and
+steps down when the camera, the CPU or the uplink cannot keep up, then climbs
+back when there is room. That means the same settings work on a slow laptop
+and a fast desktop without touching the config. Set `adaptive = no` to pin the
+numbers exactly.
+
+Capturing at a higher resolution is possible but expensive: 640x480 costs
+roughly 9 Mbit/s at 30 fps, while 1280x720 costs about 30 Mbit/s, which is
+more than most home uploads. That is why the capture size is left alone by
+default and only the send size is scaled.
 
 The viewer reads `topic`, `username`, `password` from the same file or env vars.
 
@@ -106,6 +119,9 @@ The viewer reads `topic`, `username`, `password` from the same file or env vars.
 | `POST /start` / `POST /stop` | camera on / off |
 | `POST /mic/start` / `POST /mic/stop` | mic on / off |
 | `GET /status` | `{"active", "mic", "sample_rate", "channels"}` |
+| `GET /devices` | cameras and microphones the host can see |
+| `POST /camera/select?index=N` | switch camera |
+| `POST /mic/select?index=N` | switch microphone (`-1` = system default) |
 | `GET /logs` | host log lines |
 
 ## Troubleshooting
@@ -123,6 +139,11 @@ The viewer reads `topic`, `username`, `password` from the same file or env vars.
   on, every startup failure is written there and shown in a dialog.
 - **Forgot the password, or want to start over.** Delete `roomcam_config.ini`
   next to the exe. The next run asks again.
+- **Missing camera or microphone.** Either one alone is fine. A host with no
+  camera still streams audio, and `/video` answers 503 rather than hanging. A
+  host with no microphone still streams video. Picking a device that fails to
+  open leaves that half switched off, and picking a working one turns it back
+  on.
 - **No audio, video fine.** Check the host log for "Mic could not start" and
   set `mic_device` in `roomcam_config.ini` to the right index.
 
