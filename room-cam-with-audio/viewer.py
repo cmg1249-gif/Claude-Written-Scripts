@@ -27,6 +27,7 @@ Test options (optional):
 import argparse
 import base64
 import json
+import select
 import socket
 import struct
 import threading
@@ -68,24 +69,84 @@ _AUTH_HEADER = "Basic " + base64.b64encode(
 
 
 # ---- Discovery (unchanged from Room Cam v2) --------------------------------
-def discover_host(timeout=5):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(timeout)
+def local_ipv4_addresses():
+    """Every IPv4 address this machine holds, plus 0.0.0.0 (let the OS pick).
+
+    We ask two ways because neither is complete on its own: getaddrinfo misses
+    some adapters, and the connect-to-8.8.8.8 trick only reveals the one that
+    routes to the internet.
+    """
+    ips = {"0.0.0.0"}
     try:
-        sock.sendto(DISCOVERY_REQUEST, ("255.255.255.255", DISCOVERY_PORT))
-        while True:
-            data, addr = sock.recvfrom(1024)
-            text = data.decode(errors="ignore").strip()
-            if text.startswith(DISCOVERY_REPLY_PREFIX):
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        ips.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    return sorted(ips)
+
+
+def discover_host(timeout=5):
+    """Broadcast a discovery ping and wait for the host to answer.
+
+    Returns (advertised_ip, port, replying_ip) or None.
+
+    The ping goes out EVERY local interface, not just the default one. That
+    matters on machines with VirtualBox, VPN, WSL or Hyper-V adapters: Windows
+    sends a plain 255.255.255.255 broadcast out only ONE interface, and it is
+    often a virtual one, so the real network never sees the request. Binding a
+    socket to each address forces the broadcast out that specific adapter. We
+    also aim at each interface's own x.y.z.255, which some networks pass when
+    they drop the all-ones address.
+    """
+    socks = []
+    for local_ip in local_ipv4_addresses():
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.bind((local_ip, 0))
+            sock.setblocking(False)
+        except OSError:
+            continue                      # adapter went away; just skip it
+        targets = ["255.255.255.255"]
+        if local_ip != "0.0.0.0":
+            targets.append(".".join(local_ip.split(".")[:3]) + ".255")
+        for target in targets:
+            try:
+                sock.sendto(DISCOVERY_REQUEST, (target, DISCOVERY_PORT))
+            except OSError:
+                pass                      # e.g. link down; other sockets remain
+        socks.append(sock)
+
+    if not socks:
+        return None
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select(socks, [], [], 0.3)
+            for sock in ready:
+                try:
+                    data, addr = sock.recvfrom(1024)
+                except OSError:
+                    continue
+                text = data.decode(errors="ignore").strip()
+                if not text.startswith(DISCOVERY_REPLY_PREFIX):
+                    continue
                 parts = text.split(":")
                 ip = parts[1] if len(parts) > 1 and parts[1] else addr[0]
                 port = parts[2] if len(parts) > 2 else "5000"
-                return ip, port
-    except (socket.timeout, OSError):
+                return ip, port, addr[0]
         return None
     finally:
-        sock.close()
+        for sock in socks:
+            sock.close()
 
 
 def discover_host_retry(attempt_timeout=5):
@@ -97,11 +158,14 @@ def discover_host_retry(attempt_timeout=5):
             return found
         if attempt == 1 or attempt % 6 == 0:
             print("Still searching for the camera host... (Ctrl+C to stop)")
+        if attempt == 6:
+            print("   Tip: if the host is running, some networks block broadcast.")
+            print("   Run it with the host's address instead, e.g.  viewer --ip 192.168.0.77")
         time.sleep(1.0)
 
 
 # ---- Host control ----------------------------------------------------------
-def api(base, path):
+def api(base, path, quiet=False):
     req = urllib.request.Request(
         f"{base}{path}", headers={"Authorization": _AUTH_HEADER}
     )
@@ -109,7 +173,8 @@ def api(base, path):
         with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read().decode())
     except Exception as exc:  # noqa: BLE001
-        print(f"[viewer] control call {path} failed: {exc}")
+        if not quiet:
+            print(f"[viewer] control call {path} failed: {exc}")
         return None
 
 
@@ -317,21 +382,44 @@ def main():
     ap.add_argument("--seconds", type=float, default=0, help="auto-quit after N s")
     ap.add_argument("--record", metavar="FILE.wav", help="save received audio")
     ap.add_argument("--device", type=int, default=None, help="speaker device index")
+    ap.add_argument("--ip", help="host's IP address (skips discovery)")
+    ap.add_argument("--port", default="5000", help="host's port (default 5000)")
     args = ap.parse_args()
 
-    print("Searching the network for the camera host...")
-    try:
-        ip, port = discover_host_retry()
-    except KeyboardInterrupt:
-        print("\nStopped searching.")
-        return
+    if args.ip:
+        candidates = [(args.ip, args.port)]
+        print(f"Connecting to {args.ip}:{args.port} (discovery skipped)...")
+    else:
+        print("Searching the network for the camera host...")
+        try:
+            ip, port, replied_from = discover_host_retry()
+        except KeyboardInterrupt:
+            print("\nStopped searching.")
+            return
+        print(f"Found the host at {ip}:{port}")
+        # The host advertises the address of whichever adapter routes to the
+        # internet. On a machine with virtual adapters that is not always the
+        # one we can reach, so keep the address the reply actually came from
+        # as a backup.
+        candidates = [(ip, port)]
+        if replied_from and replied_from != ip:
+            candidates.append((replied_from, port))
 
-    base = f"http://{ip}:{port}"
-    print(f"Found the host at {ip}:{port}")
-
-    status = api(base, "/status")
-    if status is None:
-        print("Found the host but couldn't reach its control API.")
+    base = None
+    status = None
+    for cand_ip, cand_port in candidates:
+        trial = f"http://{cand_ip}:{cand_port}"
+        status = api(trial, "/status", quiet=True)
+        if status is not None:
+            base = trial
+            if (cand_ip, cand_port) != candidates[0]:
+                print(f"Host advertised an unreachable address; using {cand_ip} instead.")
+            break
+    if base is None:
+        tried = ", ".join(f"{i}:{p}" for i, p in candidates)
+        print(f"Couldn't reach the host's control API (tried {tried}).")
+        print("Check that camera_server is running and that Windows Firewall "
+              "allows it on this network.")
         return
     if status.get("active"):
         print("Host camera is already ON.")

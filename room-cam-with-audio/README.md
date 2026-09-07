@@ -59,10 +59,12 @@ underruns, buffer depth, and the average audio/video offset in ms.
 | `GET /status` | `{"active": bool, "mic": bool}` |
 | `GET /logs` | host log lines |
 
-## Test options (viewer)
+## Viewer options
 
 | Flag | What it does |
 |------|--------------|
+| `--ip A.B.C.D` | connect straight to the host, skipping discovery |
+| `--port N` | host's port if you changed it (default 5000) |
 | `--seconds N` | quit automatically after N seconds |
 | `--record out.wav` | save the received audio to a WAV file |
 | `--device N` | pick a speaker (`python -m sounddevice` lists them) |
@@ -73,6 +75,26 @@ underruns, buffer depth, and the average audio/video offset in ms.
 - `MIC_ON_AT_CONNECT` (viewer): `True` = mic comes on with the camera.
 - `PREBUFFER_SECONDS` / `MAX_BUFFER_SECONDS` (viewer): audio jitter buffer.
   Bigger = smoother on bad Wi-Fi, but more lag.
+
+## Troubleshooting
+
+- **The viewer never finds the host.** Some networks drop broadcast traffic
+  between devices; guest Wi-Fi and "client isolation" on the access point are
+  the usual culprits. A laptop with VirtualBox, VPN, WSL or Hyper-V adapters
+  can also send the broadcast out a virtual adapter instead of the real one.
+  Skip discovery and name the host directly:
+
+  ```
+  viewer.exe --ip 192.168.0.77
+  ```
+
+  The host prints its own address when it starts.
+- **Found the host but can't reach it.** Windows Firewall needs an inbound
+  rule for `camera_server.exe` on the network profile in use. The rule is tied
+  to the exe's **path**, so a fresh download or a moved folder needs a new rule
+  even though the old one is still listed.
+- **Both machines must be on the same subnet.** The laptop's address should
+  start with the same three numbers as the host's.
 
 ## ⚠️ Security
 
