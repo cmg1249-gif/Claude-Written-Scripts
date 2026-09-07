@@ -3,3 +3,4 @@ opencv-python
 pycloudflared
 sounddevice
 numpy
+imageio-ffmpeg

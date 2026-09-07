@@ -5,10 +5,17 @@ Tokenless: it reads the public ntfy.sh mailbox to find the host's current
 public URL (same as Room Cam Web v2.0), then shows the live video and plays the
 host's microphone in sync, with a key to switch the mic on and off.
 
-    pip install opencv-python sounddevice numpy
+    pip install opencv-python sounddevice numpy imageio-ffmpeg
     python viewer.py
 
+Recording: click the on-screen "REC" button (top-left of the video) or press
+r to start/stop. Each recording is one audio+video file dropped next to the
+viewer (roomcam_YYYYMMDD_HHMMSS.<format>). imageio-ffmpeg supplies the ffmpeg
+used to merge the two streams; without it the audio and video are saved as two
+separate files instead.
+
 Keys (with the video window focused):
+    r  = start/stop RECORDING (same as the on-screen REC button)
     m  = toggle the host MIC on/off
     q  = quit AND turn the host camera + mic OFF
     l  = quit but LEAVE the host camera + mic running
@@ -22,18 +29,22 @@ Options (optional):
     --url URL          skip the mailbox and connect to this URL
     --seconds N        quit automatically after N seconds
     --record out.wav   also save received audio to a WAV file
+    --format FMT       recording container: mp4 (default), mkv, or avi
     --device N         speaker device index (see:  python -m sounddevice)
 """
 
 import argparse
 import base64
 import configparser
+import datetime
 import getpass
 import json
 import os
 import random
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -421,7 +432,7 @@ def read_exact(resp, n):
     return b"".join(chunks)
 
 
-def audio_reader(host, clock, wav, stop_event):
+def audio_reader(host, clock, wav, recorder, stop_event):
     while not stop_event.is_set():
         try:
             resp = host.open_stream("/audio")
@@ -444,6 +455,8 @@ def audio_reader(host, clock, wav, stop_event):
                 clock.push(ts, seq, pcm)
                 if wav:
                     wav.writeframes(pcm)
+                if recorder:
+                    recorder.write_audio(pcm)
         if not stop_event.is_set():
             print("[viewer] audio stream ended; reconnecting...")
             time.sleep(1.0)
@@ -573,6 +586,248 @@ class VideoLagTracker:
               f"delaying audio to match (buffer {target*1000:.0f}ms)")
 
 
+# ---- Recording (audio + video -> one file) ---------------------------------
+def _base_dir():
+    """Where a recording lands: next to viewer.exe when frozen, else next to
+    this script (the same folder as roomcam_config.ini)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_ffmpeg():
+    """Locate an ffmpeg binary to merge audio + video into one file. Order:
+    env var -> the copy imageio-ffmpeg bundles -> an ffmpeg next to the viewer
+    -> one on PATH. Returns None if nothing is found (then the recorder leaves
+    the audio and video as two separate files)."""
+    for env in ("IMAGEIO_FFMPEG_EXE", "FFMPEG_BINARY", "FFMPEG"):
+        p = os.environ.get(env)
+        if p and os.path.exists(p):
+            return p
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.exists(exe):
+            return exe
+    except Exception:  # noqa: BLE001
+        pass
+    local = os.path.join(_base_dir(), "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    if os.path.exists(local):
+        return local
+    return shutil.which("ffmpeg")
+
+
+# Container -> (video codec, audio codec) for the final file. The temp video is
+# always MJPEG in an AVI at a placeholder rate; ffmpeg re-times it on the way
+# out, so these codecs are the only per-format choice.
+RECORD_FORMATS = {
+    "mp4": ("libx264", "aac"),
+    "mkv": ("libx264", "aac"),
+    "avi": ("mjpeg", "pcm_s16le"),
+}
+DEFAULT_RECORD_FORMAT = "mp4"
+NOMINAL_FPS = 20.0          # placeholder rate for the temp AVI; ffmpeg re-times
+
+REC_BTN = (12, 12, 118, 46)     # x1, y1, x2, y2 of the on-screen Record button
+
+
+def _in_button(x, y, rect=REC_BTN):
+    return rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]
+
+
+def draw_rec_button(img, recording, elapsed):
+    """Draw the REC button (and, while recording, a blinking dot + timer) onto
+    a copy of the frame that is shown but never saved."""
+    x1, y1, x2, y2 = REC_BTN
+    panel = img.copy()
+    cv2.rectangle(panel, (x1, y1), (x2, y2), (28, 28, 34), -1)
+    cv2.addWeighted(panel, 0.55, img, 0.45, 0, img)
+    cy = (y1 + y2) // 2
+    if recording:
+        blink = int(time.monotonic() * 2) % 2 == 0
+        cv2.circle(img, (x1 + 15, cy), 7, (0, 0, 235) if blink else (0, 0, 90), -1)
+        cv2.putText(img, "REC", (x1 + 30, y2 - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
+        mm, ss = divmod(int(elapsed), 60)
+        cv2.putText(img, f"{mm:02d}:{ss:02d}", (x2 + 10, y2 - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 60, 235), 1, cv2.LINE_AA)
+        border = (60, 60, 235)
+    else:
+        cv2.circle(img, (x1 + 15, cy), 7, (60, 60, 235), -1)
+        cv2.putText(img, "REC", (x1 + 30, y2 - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+        border = (95, 95, 95)
+    cv2.rectangle(img, (x1, y1), (x2, y2), border, 1)
+
+
+class Recorder:
+    """Toggle-on/off recording of the live view to ONE audio+video file in the
+    output folder. Decoded video frames go to a temp MJPEG AVI, received PCM to
+    a temp WAV; on stop the two are muxed with ffmpeg and the video is re-timed
+    so its length matches the audio (audio is the master clock, same as
+    playback). If ffmpeg can't be found, the two temp files are kept instead."""
+
+    def __init__(self, out_dir, fmt):
+        self.out_dir = out_dir
+        self.fmt = fmt if fmt in RECORD_FORMATS else DEFAULT_RECORD_FORMAT
+        self.ffmpeg = find_ffmpeg()
+        self._lock = threading.Lock()
+        self.recording = False
+        self._reset()
+
+    def _reset(self):
+        self.vw = None
+        self.wav = None
+        self.size = None            # (w, h) the video writer was opened with
+        self.channels = 1
+        self.rate = 16000
+        self.video_frames = 0
+        self.audio_frames = 0       # sample frames -> exact audio duration
+        self.t0 = 0.0
+        self._vpath = self._apath = self._base = None
+
+    def start(self, frame, rate, channels):
+        """main thread: open the temp writers sized to the current frame."""
+        with self._lock:
+            if self.recording:
+                return
+            h, w = frame.shape[:2]
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._base = f"roomcam_{stamp}"
+            self._vpath = os.path.join(self.out_dir, self._base + ".video.avi")
+            self._apath = os.path.join(self.out_dir, self._base + ".audio.wav")
+            vw = cv2.VideoWriter(
+                self._vpath, cv2.VideoWriter_fourcc(*"MJPG"), NOMINAL_FPS, (w, h)
+            )
+            if not vw.isOpened():
+                print("[viewer] could not open a video writer; recording aborted.")
+                self._reset()
+                return
+            wav = wave.open(self._apath, "wb")
+            wav.setnchannels(channels)
+            wav.setsampwidth(2)
+            wav.setframerate(rate)
+            self.vw, self.wav = vw, wav
+            self.size = (w, h)
+            self.rate, self.channels = rate, channels
+            self.video_frames = self.audio_frames = 0
+            self.t0 = time.monotonic()
+            self.recording = True
+            print(f"[viewer] RECORDING -> {self._base}.{self.fmt}")
+
+    def write_video(self, frame):
+        """main thread: called once per newly shown frame."""
+        if not self.recording or self.vw is None:
+            return
+        if (frame.shape[1], frame.shape[0]) != self.size:
+            frame = cv2.resize(frame, self.size)
+        self.vw.write(frame)
+        self.video_frames += 1
+
+    def write_audio(self, pcm):
+        """audio thread: called for every received PCM chunk."""
+        with self._lock:
+            if not self.recording or self.wav is None:
+                return
+            self.wav.writeframes(pcm)
+            self.audio_frames += len(pcm) // (2 * self.channels)
+
+    def elapsed(self):
+        return time.monotonic() - self.t0 if self.recording else 0.0
+
+    def toggle(self, frame, rate, channels):
+        if self.recording:
+            return self.stop()
+        if frame is None:
+            print("[viewer] no video yet -- can't start recording.")
+            return None
+        self.start(frame, rate, channels)
+        return None
+
+    def stop(self):
+        """Close the writers, then mux. Returns the saved path (or the kept
+        temp video path if the merge could not run)."""
+        with self._lock:
+            if not self.recording:
+                return None
+            self.recording = False
+            vw, wav = self.vw, self.wav
+            vpath, apath, base = self._vpath, self._apath, self._base
+            vframes, aframes = self.video_frames, self.audio_frames
+            rate = self.rate
+            elapsed = max(time.monotonic() - self.t0, 0.001)
+            fmt = self.fmt
+            self.vw = self.wav = None
+        if vw is not None:
+            vw.release()
+        if wav is not None:
+            wav.close()
+        if vframes == 0:
+            print("[viewer] recording had no video frames; nothing saved.")
+            _quiet_remove(vpath, apath)
+            return None
+        out = os.path.join(self.out_dir, f"{base}.{fmt}")
+        if self._mux(vpath, apath, out, vframes, aframes, rate, elapsed, fmt):
+            _quiet_remove(vpath, apath)
+            print(f"[viewer] saved {out}")
+            return out
+        print("[viewer] could not merge audio+video; kept them separately:")
+        print(f"          {vpath}")
+        print(f"          {apath}")
+        return vpath
+
+    def _mux(self, vpath, apath, out, vframes, aframes, rate, elapsed, fmt):
+        if not self.ffmpeg:
+            print("[viewer] ffmpeg not found (pip install imageio-ffmpeg) --"
+                  " can't merge.")
+            return False
+        have_audio = aframes > 0
+        # The video should last as long as the audio it lines up with; with no
+        # audio, fall back to real wall-clock fps.
+        if have_audio:
+            audio_secs = aframes / float(rate)
+            fps = vframes / audio_secs if audio_secs > 0 else NOMINAL_FPS
+        else:
+            fps = vframes / elapsed
+        fps = min(max(fps, 1.0), 120.0)
+        vcodec, acodec = RECORD_FORMATS.get(fmt, RECORD_FORMATS[DEFAULT_RECORD_FORMAT])
+        cmd = [self.ffmpeg, "-y", "-loglevel", "error",
+               "-r", f"{fps:.4f}", "-i", vpath]
+        if have_audio:
+            cmd += ["-i", apath]
+        cmd += ["-c:v", vcodec]
+        if vcodec == "libx264":
+            cmd += ["-preset", "veryfast", "-pix_fmt", "yuv420p"]
+        elif vcodec == "mjpeg":
+            cmd += ["-q:v", "5"]
+        if have_audio:
+            cmd += ["-c:a", acodec]
+            if acodec == "aac":
+                cmd += ["-b:a", "128k"]
+            cmd += ["-shortest"]
+        cmd.append(out)
+        flags = 0x08000000 if os.name == "nt" else 0    # CREATE_NO_WINDOW
+        try:
+            res = subprocess.run(cmd, capture_output=True, creationflags=flags)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[viewer] ffmpeg failed to run: {exc}")
+            return False
+        if res.returncode != 0:
+            tail = res.stderr.decode(errors="ignore").strip().splitlines()
+            print(f"[viewer] ffmpeg error: {tail[-1] if tail else res.returncode}")
+            return False
+        return os.path.exists(out) and os.path.getsize(out) > 0
+
+
+def _quiet_remove(*paths):
+    for p in paths:
+        try:
+            if p:
+                os.remove(p)
+        except OSError:
+            pass
+
+
 # ---- Main --------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Room Cam Web with Audio viewer.")
@@ -580,6 +835,8 @@ def main():
     ap.add_argument("--url", help="host URL (skips the ntfy mailbox)")
     ap.add_argument("--seconds", type=float, default=0, help="auto-quit after N s")
     ap.add_argument("--record", metavar="FILE.wav", help="save received audio")
+    ap.add_argument("--format", choices=sorted(RECORD_FORMATS), default=DEFAULT_RECORD_FORMAT,
+                    help="recording container (default: mp4)")
     ap.add_argument("--device", type=int, default=None, help="speaker device index")
     args = ap.parse_args()
 
@@ -642,6 +899,14 @@ def main():
         wav.setsampwidth(2)
         wav.setframerate(rate)
 
+    recorder = Recorder(_base_dir(), args.format)
+    if recorder.ffmpeg:
+        print(f"Recording -> {recorder.out_dir}  (format: {recorder.fmt}). "
+              "Press r or click REC.")
+    else:
+        print("Recording available, but ffmpeg was not found: audio and video "
+              "will be saved as two files. (pip install imageio-ffmpeg)")
+
     def speaker_callback(outdata, frames_n, time_info, status_flags):
         nbytes = frames_n * 2 * channels
         outdata[:] = np.frombuffer(clock.pull(nbytes), dtype=DTYPE).reshape(frames_n, channels)
@@ -664,7 +929,7 @@ def main():
     speaker = _open_speaker(rate, channels, args.device)
 
     threading.Thread(
-        target=audio_reader, args=(host, clock, wav, stop_event), daemon=True
+        target=audio_reader, args=(host, clock, wav, recorder, stop_event), daemon=True
     ).start()
 
     frames = deque(maxlen=400)
@@ -688,13 +953,25 @@ def main():
     if len(mics) > 1:
         print(f"Microphones on the host: {len(mics) - 1} found")
 
-    print("Live. Keys:  m = mic on/off  |  c = next camera  |  n = next mic")
-    print("             q = quit + all off  |  l = quit, leave on")
+    print("Live. Keys:  r = record on/off  |  m = mic on/off  |  c = next camera")
+    print("             n = next mic  |  q = quit + all off  |  l = quit, leave on")
     shut_down = False
     started = time.monotonic()
     last_report = started
     window = "Room Cam Web with Audio"
     lag_tracker = VideoLagTracker(clock)
+
+    ui = {"frame": None}            # newest clean (un-annotated) frame
+
+    def handle_toggle():
+        recorder.toggle(ui["frame"], clock.rate, clock.channels)
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and _in_button(x, y):
+            handle_toggle()
+
+    cv2.namedWindow(window)
+    cv2.setMouseCallback(window, on_mouse)
     current_cam = device_info.get("current_camera", 0)
     cam_pos = cameras.index(current_cam) if current_cam in cameras else 0
     current_mic = device_info.get("current_mic", -1)
@@ -715,7 +992,14 @@ def main():
             if jpeg is not None:
                 frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
                 if frame is not None:
-                    cv2.imshow(window, frame)
+                    ui["frame"] = frame
+                    recorder.write_video(frame)   # save the clean frame
+            # Redraw every loop so the REC button (and its blink/timer) stays
+            # live and clickable even between incoming frames.
+            if ui["frame"] is not None:
+                display = ui["frame"].copy()
+                draw_rec_button(display, recorder.recording, recorder.elapsed())
+                cv2.imshow(window, display)
 
             key = cv2.waitKey(5) & 0xFF
             if key == ord("q"):
@@ -723,6 +1007,8 @@ def main():
                 break
             if key == ord("l"):
                 break
+            if key == ord("r"):
+                handle_toggle()
             if key == ord("m"):
                 if mic_on:
                     host.api("/mic/stop")
@@ -767,6 +1053,9 @@ def main():
         pass
 
     stop_event.set()
+    if recorder.recording:
+        print("[viewer] finishing the recording...")
+        recorder.stop()
     if speaker:
         speaker.stop()
         speaker.close()

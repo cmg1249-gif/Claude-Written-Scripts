@@ -6,6 +6,8 @@ either side. Settings are promptable, so you never edit code.
 
 - **Camera and mic are OFF until someone watches** (webcam light dark when idle).
 - **Mic can be switched on/off** from the viewer (`m` key) or the web page.
+- **Record to one file** from the viewer: an on-screen **REC** button (or `r`)
+  saves synced audio+video next to the viewer as `roomcam_<timestamp>.mp4`.
 - **Audio and video are synced** in `viewer.py`: every frame and audio chunk
   carries the host's clock; the viewer shows each frame when that instant's
   sound is playing.
@@ -49,7 +51,7 @@ to change anything later. Nothing lives in the code.
 ## Watch and listen from your laptop (any network)
 
 ```bash
-pip install opencv-python sounddevice numpy
+pip install opencv-python sounddevice numpy imageio-ffmpeg
 python viewer.py
 ```
 …or run `viewer.exe`. It reads the mailbox, finds the host, asks for the host
@@ -57,6 +59,7 @@ password once (or reads it from a `roomcam_config.ini` beside it, or the
 `ROOMCAM_PASSWORD` env var), then shows video and plays audio in sync.
 
 Keys (with the video window focused):
+- `r` — start/stop **recording** (same as the on-screen REC button)
 - `m` — toggle the host **mic** on/off
 - `c` — switch to the host's next **camera**
 - `n` — switch to the host's next **microphone**
@@ -64,6 +67,25 @@ Keys (with the video window focused):
 - `l` — quit but leave them running
 
 The web page has dropdowns for the same two things.
+
+## Recording
+
+Click the **REC** button in the top-left of the video (or press `r`) to start;
+click again (or `r`) to stop. Each recording is written as **one file** —
+synced audio + video — into the folder the viewer runs from
+(`roomcam_YYYYMMDD_HHMMSS.mp4` by default), named by the time it started. A red
+dot and a running timer show while it's recording, and a still-recording session
+is finished off cleanly when you quit.
+
+The two streams are merged with **ffmpeg**, supplied by the `imageio-ffmpeg`
+package (bundled into `viewer.exe`), so nothing extra needs installing. If no
+ffmpeg can be found, the audio and video are kept as two separate files instead
+of one, so a recording is never lost.
+
+Pick the container with `--format`: `mp4` (default, H.264 + AAC), `mkv` (same
+codecs), or `avi` (MJPEG + PCM — larger, but no re-encoding of the video).
+Video length is tied to the audio, which is the same master clock playback uses,
+so the recording stays in sync even when the tunnel delivers frames unevenly.
 
 `python viewer.py --browser` opens the page in your browser instead (the old
 v2.0 behaviour). Use the **Listen** and **Mic** buttons there.
@@ -106,7 +128,8 @@ The viewer reads `topic`, `username`, `password` from the same file or env vars.
 | `--browser` | open the web page instead of the synced viewer |
 | `--url URL` | skip the mailbox and connect straight to a URL |
 | `--seconds N` | quit automatically after N seconds |
-| `--record out.wav` | save received audio to a WAV file |
+| `--record out.wav` | save the whole session's received audio to a WAV file |
+| `--format mp4\|mkv\|avi` | container for REC-button recordings (default `mp4`) |
 | `--device N` | pick a speaker |
 
 ## Host endpoints
@@ -166,4 +189,4 @@ single password.
 | `webcam_server.py` | Host: tunnel + ntfy publish + video + audio + mic on/off. |
 | `viewer.py` | Laptop: reads ntfy, shows video, plays audio in sync. |
 | `roomcam_config.ini` | Auto-created on first run; holds your password + topic. **Not committed.** |
-| `requirements.txt` | `flask`, `opencv-python`, `pycloudflared`, `sounddevice`, `numpy`. |
+| `requirements.txt` | `flask`, `opencv-python`, `pycloudflared`, `sounddevice`, `numpy`, `imageio-ffmpeg`. |

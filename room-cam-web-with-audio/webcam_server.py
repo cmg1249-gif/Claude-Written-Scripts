@@ -436,7 +436,7 @@ INDEX_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Room Cam</title>
+  <title>Ducky Cam</title>
   <style>
     body { margin:0; background:#0b0b0d; color:#ddd;
            font-family: system-ui, sans-serif; text-align:center; }
@@ -454,7 +454,7 @@ INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <h1>ROOM CAM &mdash; LIVE</h1>
+  <h1>DUCKY CAM &mdash; LIVE</h1>
   <img src="/video" alt="Live feed">
   <div class="bar">
     <button id="listen">&#128264; Listen</button>
