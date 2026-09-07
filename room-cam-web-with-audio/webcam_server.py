@@ -29,6 +29,7 @@ import logging
 import os
 import queue
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -39,6 +40,21 @@ from collections import deque
 import cv2
 import sounddevice as sd
 from flask import Flask, Response, jsonify, request
+
+# ---- Keep helper processes windowless (Windows) ----------------------------
+# pycloudflared starts cloudflared.exe with a plain subprocess.Popen, which on
+# Windows opens a blank console window that then sits on the desktop for as
+# long as the tunnel is up. There is no option to pass through, so add the
+# "no window" creation flag to every child process this app starts.
+if sys.platform == "win32":
+    _CREATE_NO_WINDOW = 0x08000000
+
+    class _WindowlessPopen(subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | _CREATE_NO_WINDOW
+            super().__init__(*args, **kwargs)
+
+    subprocess.Popen = _WindowlessPopen
 
 # ---- Config: you should NEVER need to edit this code -----------------------
 # Real settings are resolved at startup (see load_config) in this order:

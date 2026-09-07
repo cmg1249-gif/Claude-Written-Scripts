@@ -27,14 +27,31 @@ import hmac
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 from collections import deque
 
 import cv2
 from flask import Flask, Response, jsonify, request
+
+# ---- Keep helper processes windowless (Windows) ----------------------------
+# pycloudflared starts cloudflared.exe with a plain subprocess.Popen, which on
+# Windows opens a blank console window that then sits on the desktop for as
+# long as the tunnel is up. There is no option to pass through, so add the
+# "no window" creation flag to every child process this app starts.
+if sys.platform == "win32":
+    _CREATE_NO_WINDOW = 0x08000000
+
+    class _WindowlessPopen(subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | _CREATE_NO_WINDOW
+            super().__init__(*args, **kwargs)
+
+    subprocess.Popen = _WindowlessPopen
 
 # ---- Config: you should NEVER need to edit this code -----------------------
 # Real settings are resolved at startup (see load_config) in this order:
@@ -244,10 +261,13 @@ def open_public_tunnel(port):
     Quick tunnels need NO account and NO token -- just the cloudflared binary,
     which pycloudflared downloads automatically on first use.
     """
+    # Catch Exception, not just ImportError: a PyInstaller build that misses
+    # pycloudflared's bundled data files fails here with FileNotFoundError,
+    # which used to escape this guard and kill the tunnel thread outright.
     try:
         from pycloudflared import try_cloudflare
-    except ImportError:
-        log("pycloudflared not installed -> local only. `pip install pycloudflared`")
+    except Exception as exc:  # noqa: BLE001
+        log(f"pycloudflared unavailable: {exc}")
         return None
     try:
         return try_cloudflare(port=port).tunnel
@@ -277,12 +297,46 @@ def publish_url_to_mailbox(url):
         return False
 
 
+def report_problem(summary):
+    """Say something out loud. This server runs with no console, so anything
+    that only reaches the log buffer is invisible to whoever started it."""
+    try:
+        path = os.path.join(os.path.dirname(_config_path()), "roomcam_error.log")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} =====\n"
+                     f"{summary}\n" + "\n".join(LOG_BUFFER) + "\n")
+    except OSError:
+        path = "(could not write a log file)"
+    print(summary)
+    if sys.stdin is None or not sys.stdin.isatty():
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "Room Cam Web", f"{summary}\n\nDetails were saved to:\n{path}"
+            )
+            root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _startup_tunnel_and_publish():
     """Open the tunnel, then keep the URL fresh in the mailbox. Runs in a
     background thread so the web server starts serving immediately."""
-    public_url = open_public_tunnel(PORT)
+    try:
+        public_url = open_public_tunnel(PORT)
+    except Exception:  # noqa: BLE001 - a dead thread here must not be silent
+        public_url = None
+        log(f"Tunnel thread failed:\n{traceback.format_exc()}")
     if not public_url:
         log("No public tunnel -> serving on the local network only.")
+        report_problem(
+            "The internet tunnel could not be opened, so there is no public "
+            "address for this camera.\n\nThe camera is still reachable on your "
+            f"local network at port {PORT}."
+        )
         return
     log(f"PUBLIC url: {public_url}  (log in {USERNAME} / {PASSWORD})")
     while True:
