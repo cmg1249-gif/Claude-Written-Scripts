@@ -8,6 +8,7 @@ matching GitHub release (built with PyInstaller `--onefile`).
 |---------|--------------|-------------|
 | [`room-cam/`](room-cam) | LAN webcam viewer with zero-config UDP auto-discovery. Camera stays off until a viewer connects; password-gated. | `room-cam-v2.0` |
 | [`room-cam-web/`](room-cam-web) | Room Cam over the internet: tokenless Cloudflare quick tunnel + ntfy.sh rendezvous, promptable config. | `room-cam-web-v2.0` |
+| [`room-cam-web-with-audio/`](room-cam-web-with-audio) | Room Cam Web plus the host mic over the same tunnel, synced, with mic on/off from the viewer or the web page. Promptable config, no tokens. | `room-cam-web-with-audio-v1.0.0` |
 | [`telephone/`](telephone) | One-way live audio between two machines on the same network. Sender finds the receiver by LAN broadcast; no IP to type. | `telephone-v1.0.0` |
 | [`room-cam-with-audio/`](room-cam-with-audio) | Room Cam v2 (auto-discovered LAN webcam viewer) plus the host microphone, streamed in sync, with a mic on/off key. | `room-cam-with-audio-v1.0.0` |
 
@@ -28,6 +29,9 @@ pyinstaller --onefile --noconsole camera_server.py
 pyinstaller --onefile viewer.py
 cd ../room-cam-web
 pyinstaller --onefile --noconsole webcam_server.py
+pyinstaller --onefile viewer.py
+cd ../room-cam-web-with-audio
+pyinstaller --onefile --noconsole --collect-all pycloudflared webcam_server.py
 pyinstaller --onefile viewer.py
 cd ../room-cam-with-audio
 pyinstaller --onefile --noconsole camera_server.py

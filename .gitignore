@@ -7,3 +7,4 @@ dist/
 *.wav
 *.log
 *.exe
+roomcam_config.ini
