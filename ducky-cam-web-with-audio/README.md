@@ -1,4 +1,4 @@
-# Room Cam Web with Audio
+# Ducky Cam Web with Audio
 
 > ⚠️ **Proof of concept — for learning and authorized use only.** This is a
 > personal project built to explore webcam/mic streaming, tunneling, and A/V
@@ -8,7 +8,7 @@
 > Covert surveillance is illegal in most places and is not what this tool is
 > for. Use it responsibly, on yourself and your own equipment.
 
-[Room Cam Web](../room-cam-web) v2.0 plus the host's **microphone**. Watch and
+[Ducky Cam Web](../ducky-cam-web) v2.0 plus the host's **microphone**. Watch and
 listen from **anywhere on the internet** with **no accounts and no tokens** on
 either side. Settings are promptable, so you never edit code.
 
@@ -21,7 +21,7 @@ either side. Settings are promptable, so you never edit code.
   sound is playing.
 - **Browser works too:** the page has a **Listen** button and a **Mic** button.
 - **Tokenless the whole way:** Cloudflare quick tunnel + public ntfy.sh topic,
-  exactly like Room Cam Web. Nothing to sign up for, no ngrok.
+  exactly like Ducky Cam Web. Nothing to sign up for, no ngrok.
 - **Password-gated** (`admin` / `1337` by default; you're asked to change it).
 
 ## How it works
@@ -41,7 +41,7 @@ Audio is 16 kHz mono (voice quality, about 256 kbit/s upload from the host).
 bursts and sometimes stall for a second or more, so the viewer holds about a
 second of audio before playing and raises that by itself if the link is worse.
 Video is held back to match, so lips and sound still line up. The LAN version
-([room-cam-with-audio](../room-cam-with-audio)) runs at about 50 ms instead.
+([ducky-cam-with-audio](../ducky-cam-with-audio)) runs at about 50 ms instead.
 
 ## Run the host
 

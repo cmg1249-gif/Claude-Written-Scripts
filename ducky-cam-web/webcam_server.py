@@ -1,5 +1,5 @@
 """
-Room Cam Web — internet-accessible webcam (install, run, forget).
+Ducky Cam Web — internet-accessible webcam (install, run, forget).
 
 The host needs NO account, NO token, and NO configuration:
   1. It opens a Cloudflare "quick tunnel" -> a public https URL (no login).
@@ -151,7 +151,7 @@ def require_login():
         return Response(
             "Login required.",
             401,
-            {"WWW-Authenticate": 'Basic realm="Room Cam Web"'},
+            {"WWW-Authenticate": 'Basic realm="Ducky Cam Web"'},
         )
 
 
@@ -202,7 +202,7 @@ INDEX_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Room Cam</title>
+  <title>Ducky Cam</title>
   <style>
     body { margin:0; background:#0b0b0d; color:#ddd;
            font-family: system-ui, sans-serif; text-align:center; }
@@ -315,7 +315,7 @@ def report_problem(summary):
             root = tk.Tk()
             root.withdraw()
             messagebox.showerror(
-                "Room Cam Web", f"{summary}\n\nDetails were saved to:\n{path}"
+                "Ducky Cam Web", f"{summary}\n\nDetails were saved to:\n{path}"
             )
             root.destroy()
         except Exception:  # noqa: BLE001
@@ -372,7 +372,7 @@ def _ask(prompt_text, default):
         root = tk.Tk()
         root.withdraw()
         entered = simpledialog.askstring(
-            "Room Cam Web setup", prompt_text, initialvalue=default
+            "Ducky Cam Web setup", prompt_text, initialvalue=default
         )
         root.destroy()
         return (entered or default).strip()
@@ -432,7 +432,7 @@ if __name__ == "__main__":
     PORT = int(_cfg["port"])
     CAMERA_INDEX = int(_cfg["camera_index"])
 
-    log("Room Cam Web starting. Camera is OFF until a viewer connects.")
+    log("Ducky Cam Web starting. Camera is OFF until a viewer connects.")
     log(f"Config file: {_config_path()}")
     log("Change settings there or via ROOMCAM_* env vars -- no code edits.")
     if PASSWORD == DEFAULT_PASSWORD:

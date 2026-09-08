@@ -1,6 +1,6 @@
-# Room Cam with Audio
+# Ducky Cam with Audio
 
-[Room Cam](../room-cam) v2, plus the host's **microphone**. Watch and listen
+[Ducky Cam](../ducky-cam) v2, plus the host's **microphone**. Watch and listen
 from another device on the **same network** with **zero config**. The viewer
 finds the host by LAN broadcast; there's no IP to type.
 
@@ -10,12 +10,12 @@ finds the host by LAN broadcast; there's no IP to type.
   host's clock, and the viewer shows each frame when the sound from that
   instant is coming out of the speakers.
 - **Password-gated** (`admin` / `1337` by default; change it).
-- Same discovery, same keys, same endpoints as Room Cam, plus the mic ones.
+- Same discovery, same keys, same endpoints as Ducky Cam, plus the mic ones.
 
 ## How it works
 
 ```
-laptop: broadcasts "who is the room cam?"  ->  host replies with its IP + port
+laptop: broadcasts "who is the ducky cam?"  ->  host replies with its IP + port
 laptop: turns camera + mic on, opens /video and /audio
 host:   /video = MJPEG, each frame stamped with the host clock
         /audio = raw 44.1 kHz mono PCM chunks, each stamped with the host clock
@@ -24,7 +24,7 @@ laptop: audio plays through a small jitter buffer; video waits for the audio
 ```
 
 Both streams go over the same HTTP server and the same password, so only the
-host needs a firewall opening (port 5000, same as Room Cam).
+host needs a firewall opening (port 5000, same as Ducky Cam).
 
 ## Run the host
 

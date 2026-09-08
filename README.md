@@ -6,11 +6,13 @@ matching GitHub release (built with PyInstaller `--onefile`).
 
 | Project | What it does | Release tag |
 |---------|--------------|-------------|
-| [`room-cam/`](room-cam) | LAN webcam viewer with zero-config UDP auto-discovery. Camera stays off until a viewer connects; password-gated. | `room-cam-v2.0` |
-| [`room-cam-web/`](room-cam-web) | Room Cam over the internet: tokenless Cloudflare quick tunnel + ntfy.sh rendezvous, promptable config. | `room-cam-web-v2.0` |
-| [`room-cam-web-with-audio/`](room-cam-web-with-audio) | Room Cam Web plus the host mic over the same tunnel, synced, with mic on/off from the viewer or the web page. Promptable config, no tokens. | `room-cam-web-with-audio-v1.0.0` |
+| [`ducky-cam/`](ducky-cam) | LAN webcam viewer with zero-config UDP auto-discovery. Camera stays off until a viewer connects; password-gated. | `room-cam-v2.0` |
+| [`ducky-cam-web/`](ducky-cam-web) | Ducky Cam over the internet: tokenless Cloudflare quick tunnel + ntfy.sh rendezvous, promptable config. | `room-cam-web-v2.0` |
+| [`ducky-cam-web-with-audio/`](ducky-cam-web-with-audio) | Ducky Cam Web plus the host mic over the same tunnel, synced, with mic on/off from the viewer or the web page. Promptable config, no tokens. | `room-cam-web-with-audio-v1.0.0` |
 | [`telephone/`](telephone) | One-way live audio between two machines on the same network. Sender finds the receiver by LAN broadcast; no IP to type. | `telephone-v1.0.0` |
-| [`room-cam-with-audio/`](room-cam-with-audio) | Room Cam v2 (auto-discovered LAN webcam viewer) plus the host microphone, streamed in sync, with a mic on/off key. | `room-cam-with-audio-v1.0.0` |
+| [`ducky-cam-with-audio/`](ducky-cam-with-audio) | Ducky Cam v2 (auto-discovered LAN webcam viewer) plus the host microphone, streamed in sync, with a mic on/off key. | `room-cam-with-audio-v1.0.0` |
+
+> Release tags keep their original `room-cam-*` names; the historical binaries live there. New releases will be tagged `ducky-cam-*`.
 
 ## Running from source
 
@@ -24,16 +26,16 @@ pip install pyinstaller
 cd telephone
 pyinstaller --onefile receiver.py
 pyinstaller --onefile sender.py
-cd ../room-cam
+cd ../ducky-cam
 pyinstaller --onefile --noconsole camera_server.py
 pyinstaller --onefile viewer.py
-cd ../room-cam-web
+cd ../ducky-cam-web
 pyinstaller --onefile --noconsole webcam_server.py
 pyinstaller --onefile viewer.py
-cd ../room-cam-web-with-audio
+cd ../ducky-cam-web-with-audio
 pyinstaller --onefile --noconsole --collect-all pycloudflared webcam_server.py
 pyinstaller --onefile viewer.py
-cd ../room-cam-with-audio
+cd ../ducky-cam-with-audio
 pyinstaller --onefile --noconsole camera_server.py
 pyinstaller --onefile viewer.py
 ```
@@ -44,6 +46,6 @@ they print status and take keyboard input.
 
 ## Security note
 
-These are LAN-only tools with demo credentials (`admin` / `1337` in the Room
+These are LAN-only tools with demo credentials (`admin` / `1337` in the Ducky
 Cam scripts, none in Telephone). Change the password before relying on them,
 and never expose them to the internet as-is.

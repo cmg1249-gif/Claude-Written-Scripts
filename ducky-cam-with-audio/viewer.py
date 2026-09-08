@@ -1,7 +1,7 @@
 """
-Room Cam with Audio — VIEWER (runs on any machine on the same network).
+Ducky Cam with Audio — VIEWER (runs on any machine on the same network).
 
-Same as Room Cam v2, plus sound. It finds the host by UDP broadcast (no IP to
+Same as Ducky Cam v2, plus sound. It finds the host by UDP broadcast (no IP to
 enter), turns the host camera AND mic on, shows the live feed, plays the audio,
 and mirrors the host's log lines here. It keeps retrying discovery until the
 host appears.
@@ -68,7 +68,7 @@ _AUTH_HEADER = "Basic " + base64.b64encode(
 ).decode()
 
 
-# ---- Discovery (unchanged from Room Cam v2) --------------------------------
+# ---- Discovery (unchanged from Ducky Cam v2) --------------------------------
 def local_ipv4_addresses():
     """Every IPv4 address this machine holds, plus 0.0.0.0 (let the OS pick).
 
@@ -378,7 +378,7 @@ def pick_frame(frames, frames_lock, clock, counters):
 
 # ---- Main --------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Room Cam with Audio viewer.")
+    ap = argparse.ArgumentParser(description="Ducky Cam with Audio viewer.")
     ap.add_argument("--seconds", type=float, default=0, help="auto-quit after N s")
     ap.add_argument("--record", metavar="FILE.wav", help="save received audio")
     ap.add_argument("--device", type=int, default=None, help="speaker device index")
@@ -482,7 +482,7 @@ def main():
     mic_on = bool(status.get("mic")) or MIC_ON_AT_CONNECT
     started = time.monotonic()
     last_report = started
-    window = "Room Cam with Audio (auto-discovered)"
+    window = "Ducky Cam with Audio (auto-discovered)"
     try:
         while True:
             if args.seconds and time.monotonic() - started >= args.seconds:

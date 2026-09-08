@@ -1,7 +1,7 @@
 """
-Room Cam Web with Audio — internet-accessible webcam + microphone.
+Ducky Cam Web with Audio — internet-accessible webcam + microphone.
 
-Same as Room Cam Web v2.0 (tokenless Cloudflare quick tunnel + public ntfy.sh
+Same as Ducky Cam Web v2.0 (tokenless Cloudflare quick tunnel + public ntfy.sh
 mailbox, promptable config, NO accounts), plus the host MICROPHONE:
     - GET  /audio        raw PCM chunks, each stamped with the host clock
     - POST /mic/start    mic ON
@@ -281,7 +281,7 @@ def require_login():
         return Response(
             "Login required.",
             401,
-            {"WWW-Authenticate": 'Basic realm="Room Cam Web"'},
+            {"WWW-Authenticate": 'Basic realm="Ducky Cam Web"'},
         )
 
 
@@ -749,7 +749,7 @@ def logs():
     return jsonify(lines=list(LOG_BUFFER))
 
 
-# ---- Tunnel + mailbox (unchanged from Room Cam Web v2.0) -------------------
+# ---- Tunnel + mailbox (unchanged from Ducky Cam Web v2.0) -------------------
 def open_public_tunnel(port):
     """Open a Cloudflare quick tunnel and return the public https URL, or None.
     Quick tunnels need NO account and NO token."""
@@ -802,7 +802,7 @@ def _startup_tunnel_and_publish():
             "address for this camera.\n\nThe camera is still reachable on your "
             f"local network at port {PORT}.",
             "\n".join(LOG_BUFFER),
-            title="Room Cam Web: no public address",
+            title="Ducky Cam Web: no public address",
         )
         return
     log(f"PUBLIC url: {public_url}  (log in {USERNAME} / {PASSWORD})")
@@ -828,7 +828,7 @@ def _has_console():
     return sys.stdin is not None and sys.stdin.isatty()
 
 
-def report_fatal(summary, detail="", title="Room Cam Web could not start"):
+def report_fatal(summary, detail="", title="Ducky Cam Web could not start"):
     """Make a failure visible.
 
     The host is built with --noconsole, so a problem has nowhere to print and
@@ -872,7 +872,7 @@ def _ask(prompt_text, default):
         root = tk.Tk()
         root.withdraw()
         entered = simpledialog.askstring(
-            "Room Cam Web setup", prompt_text, initialvalue=default
+            "Ducky Cam Web setup", prompt_text, initialvalue=default
         )
         root.destroy()
         return (entered or default).strip()
@@ -968,7 +968,7 @@ def main():
     CAPTURE_HEIGHT = _setting(_cfg, "capture_height", int, "a whole number")
     ADAPTIVE = str(_cfg["adaptive"]).strip().lower() in ("1", "yes", "true", "on")
 
-    log("Room Cam Web with Audio starting. Camera + mic OFF until a viewer connects.")
+    log("Ducky Cam Web with Audio starting. Camera + mic OFF until a viewer connects.")
     log(f"Config file: {_config_path()}")
     log("Change settings there or via ROOMCAM_* env vars -- no code edits.")
     if PASSWORD == DEFAULT_PASSWORD:
@@ -987,7 +987,7 @@ def main():
         if getattr(exc, "winerror", None) == 10048 or getattr(exc, "errno", None) in (48, 98):
             raise SystemExit(
                 f"Port {PORT} is already in use, so the server could not start.\n\n"
-                "Another copy of Room Cam is probably already running -- check "
+                "Another copy of Ducky Cam is probably already running -- check "
                 "Task Manager for webcam_server.exe and end it, or set a "
                 f"different 'port' in {_config_path()}."
             )
@@ -1005,7 +1005,7 @@ if __name__ == "__main__":
             sys.exit(1)
     except BaseException:              # noqa: BLE001 - last resort, must be seen
         report_fatal(
-            "Room Cam Web hit an unexpected error and stopped.",
+            "Ducky Cam Web hit an unexpected error and stopped.",
             traceback.format_exc(),
         )
         sys.exit(1)
