@@ -1,4 +1,4 @@
-# Room Cam Web
+# Ducky Cam Web
 
 Watch your webcam from **anywhere on the internet** — with **no accounts and no
 tokens** on either side. Settings are promptable, so you never edit code.

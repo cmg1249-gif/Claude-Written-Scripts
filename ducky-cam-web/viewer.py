@@ -1,5 +1,5 @@
 """
-Room Cam Web — LISTENER (runs on your laptop).
+Ducky Cam Web — LISTENER (runs on your laptop).
 
 Fully automatic and tokenless: it reads the public ntfy.sh mailbox to find the
 server's current public URL, then opens the live feed in your browser. No IPs,

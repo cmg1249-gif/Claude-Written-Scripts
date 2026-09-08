@@ -1,5 +1,5 @@
 """
-Room Cam — VIEWER (runs on any machine on the same network).
+Ducky Cam — VIEWER (runs on any machine on the same network).
 
 Fully automatic: it finds the host by UDP broadcast (no IP to enter), turns the
 host camera on, shows the live feed, and mirrors the host's log lines here. It
@@ -145,7 +145,7 @@ def main():
         if not ok:
             print("Stream ended.")
             break
-        cv2.imshow("Room Cam (auto-discovered)", frame)
+        cv2.imshow("Ducky Cam (auto-discovered)", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             shut_down = True

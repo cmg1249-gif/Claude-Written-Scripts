@@ -1,4 +1,4 @@
-# Room Cam
+# Ducky Cam
 
 Watch your webcam from another device on the **same network** — with **zero
 config**. The viewer finds the host automatically by LAN broadcast; there's no
@@ -11,7 +11,7 @@ IP to type in.
 ## How it works
 
 ```
-laptop: broadcasts "who is the room cam?"  ->  host replies with its IP + port
+laptop: broadcasts "who is the ducky cam?"  ->  host replies with its IP + port
 laptop: connects to the stream  ->  turns the camera on, shows the feed
 ```
 
@@ -44,7 +44,7 @@ Keys (with the video window focused):
 ## ⚠️ Security
 
 - This is **LAN-only** — it does not expose anything to the internet. For that,
-  see [`room-cam-web`](../room-cam-web).
+  see [`ducky-cam-web`](../ducky-cam-web).
 - **Change `PASSWORD`** in `camera_server.py`. `1337` is a public demo value; in
   the exe it's compiled in, so changing it means rebuilding.
 - Discovery is unauthenticated but only reveals the host's LAN IP — the stream

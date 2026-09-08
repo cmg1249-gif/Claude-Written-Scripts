@@ -1,8 +1,8 @@
 """
-Room Cam Web with Audio — VIEWER (runs on your laptop, any network).
+Ducky Cam Web with Audio — VIEWER (runs on your laptop, any network).
 
 Tokenless: it reads the public ntfy.sh mailbox to find the host's current
-public URL (same as Room Cam Web v2.0), then shows the live video and plays the
+public URL (same as Ducky Cam Web v2.0), then shows the live video and plays the
 host's microphone in sync, with a key to switch the mic on and off.
 
     pip install opencv-python sounddevice numpy imageio-ffmpeg
@@ -212,7 +212,7 @@ def load_settings():
     return topic, username, password
 
 
-# ---- Mailbox (unchanged from Room Cam Web v2.0) ----------------------------
+# ---- Mailbox (unchanged from Ducky Cam Web v2.0) ----------------------------
 def fetch_url_from_mailbox(topic):
     req = urllib.request.Request(
         f"https://ntfy.sh/{topic}/json?poll=1&since=12h",
@@ -858,7 +858,7 @@ def _quiet_remove(*paths):
 
 # ---- Main --------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Room Cam Web with Audio viewer.")
+    ap = argparse.ArgumentParser(description="Ducky Cam Web with Audio viewer.")
     ap.add_argument("--browser", action="store_true", help="open in browser only")
     ap.add_argument("--url", help="host URL (skips the ntfy mailbox)")
     ap.add_argument("--seconds", type=float, default=0, help="auto-quit after N s")
@@ -986,7 +986,7 @@ def main():
     shut_down = False
     started = time.monotonic()
     last_report = started
-    window = "Room Cam Web with Audio"
+    window = "Ducky Cam Web with Audio"
     lag_tracker = VideoLagTracker(clock)
 
     ui = {"frame": None}            # newest clean (un-annotated) frame
