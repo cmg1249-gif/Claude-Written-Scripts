@@ -1,33 +1,19 @@
-"""
-Ducky Cam Web with Audio — internet-accessible webcam + microphone.
+"""Camera/desktop host with listener-owned pairing and a visible tray stop control.
 
-Same as Ducky Cam Web v2.0 (tokenless Cloudflare quick tunnel + public ntfy.sh
-mailbox, promptable config, NO accounts), plus the host MICROPHONE:
-    - GET  /audio        raw PCM chunks, each stamped with the host clock
-    - POST /mic/start    mic ON
-    - POST /mic/stop     mic OFF
-    - GET  /status       {"active": .., "mic": .., "sample_rate": .., "channels": ..}
-The browser page gets a "Listen" button and a "Mic on/off" button; viewer.py
-plays video + audio in sync with an `m` key to toggle the mic.
-
-Camera and mic both stay OFF until someone asks (webcam light dark when idle).
-
-Run (or just double-click the exe):
-    pip install -r requirements.txt
-    python webcam_server.py
-
->>> SECURITY <<<
-This exposes your webcam AND microphone to the public internet behind ONE
-password. The ntfy topic is public, so the password is the real gate. '1337' is
-a demo default -- you're asked to change it on first run.
+Microphone and desktop-speaker audio share a timestamped stereo stream.
+Run webcam_server.exe, then choose the session password in viewer.exe.
 """
 
+import argparse
+import json
+from pathlib import Path
 import configparser
 import datetime
 import hmac
 import logging
 import os
 import queue
+import secrets
 import struct
 import subprocess
 import sys
@@ -40,6 +26,11 @@ from collections import deque
 import cv2
 import sounddevice as sd
 from flask import Flask, Response, jsonify, request
+from werkzeug.serving import make_server
+from combined_media import AudioMixer, desktop_frames, list_monitors, RATE, CHANNELS as MIX_CHANNELS
+from connection import Tunnel, APP
+from discovery import discovery_key, signature
+from tls import HTTPS_CONTEXT
 
 # ---- Keep helper processes windowless (Windows) ----------------------------
 # pycloudflared starts cloudflared.exe with a plain subprocess.Popen, which on
@@ -60,10 +51,8 @@ if sys.platform == "win32":
 # Real settings are resolved at startup (see load_config) in this order:
 #   1. environment variable  (ROOMCAM_PASSWORD, ROOMCAM_TOPIC, ROOMCAM_PORT, ...)
 #   2. roomcam_config.ini     (written next to this file / the .exe)
-#   3. a first-run prompt      (console, or a pop-up for the no-console exe)
-#   4. the defaults below
+#   3. the defaults below; passwords are set only by listener pairing.
 DEFAULT_USERNAME = "admin"
-DEFAULT_PASSWORD = "1337"      # public demo value; you'll be asked to change it
 DEFAULT_TOPIC = "roomcam-audio-relay-7hq2v9nk3d"  # ntfy rendezvous topic
 DEFAULT_PORT = 5000
 DEFAULT_CAMERA_INDEX = 0
@@ -89,7 +78,7 @@ MIN_QUALITY = 40               # nor below this
 
 # Filled in from config in __main__; functions read these globals at call time.
 USERNAME = DEFAULT_USERNAME
-PASSWORD = DEFAULT_PASSWORD
+PASSWORD = None
 NTFY_TOPIC = DEFAULT_TOPIC
 PORT = DEFAULT_PORT
 CAMERA_INDEX = DEFAULT_CAMERA_INDEX
@@ -117,6 +106,18 @@ AUDIO_HEADER = struct.Struct("!dIH")
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 4096
+mixer = AudioMixer()
+video_source = "camera"
+monitor_id = 1
+desktop_wanted = False
+shutdown = threading.Event()
+tunnel = None
+session_id = secrets.token_urlsafe(16)
+pair_token = secrets.token_urlsafe(32)
+pair_started = time.monotonic()
+pair_lock = threading.Lock()
+reconnect_key = None
 
 camera = None
 camera_lock = threading.Lock()
@@ -138,7 +139,8 @@ LOG_BUFFER = deque(maxlen=200)
 def log(msg):
     line = f"{datetime.datetime.now():%H:%M:%S}  {msg}"
     LOG_BUFFER.append(line)
-    print(line, flush=True)
+    if sys.stdout is not None:
+        print(line, flush=True)
 
 
 class _BufferHandler(logging.Handler):
@@ -199,27 +201,7 @@ def stop_camera():
 
 # ---- Microphone --------------------------------------------------------------
 def _mic_callback(indata, frames, time_info, status):
-    """Stamp each captured chunk with the host clock and hand a copy to every
-    connected /audio listener."""
-    global audio_seq
-    ts = time.monotonic() - frames / SAMPLE_RATE      # when this chunk STARTED
-    pcm = indata.tobytes()
-    packet = AUDIO_HEADER.pack(ts, audio_seq & 0xFFFFFFFF, len(pcm)) + pcm
-    audio_seq += 1
-    with subscribers_lock:
-        subs = list(audio_subscribers)
-    for q in subs:
-        try:
-            q.put_nowait(packet)
-        except queue.Full:
-            try:
-                q.get_nowait()          # listener too slow: drop its oldest
-            except queue.Empty:
-                pass
-            try:
-                q.put_nowait(packet)
-            except queue.Full:
-                pass
+    mixer.feed_mic(indata.tobytes(), SAMPLE_RATE)
 
 
 def start_mic():
@@ -231,20 +213,24 @@ def start_mic():
             return False
         last_exc = None
         for rate in dict.fromkeys([SAMPLE_RATE, 16000, 44100, 48000]):
+            stream = None
             try:
                 stream = sd.InputStream(
                     samplerate=rate, channels=CHANNELS, dtype=DTYPE,
                     blocksize=int(rate * 0.04), device=MIC_DEVICE,
-                    callback=_mic_callback,
+                    callback=lambda data, frames, info, status, rate=rate: mixer.feed_mic(data.tobytes(), rate),
                 )
                 stream.start()
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
+                if stream is not None:
+                    stream.close()
                 continue
             if rate != SAMPLE_RATE:
                 log(f"Mic does not support {SAMPLE_RATE} Hz; using {rate} Hz.")
                 SAMPLE_RATE = rate
             mic_stream = stream
+            mixer.set_mic(True)
             log("Mic turned ON.")
             return True
         log(f"Mic could not start: {last_exc}")
@@ -253,6 +239,7 @@ def start_mic():
 
 def stop_mic():
     global mic_stream
+    mixer.set_mic(False)
     with mic_lock:
         if mic_stream is None:
             return False
@@ -268,21 +255,73 @@ def stop_mic():
 
 # ---- Auth ------------------------------------------------------------------
 def is_authorized(auth):
-    if auth is None:
+    if auth is None or PASSWORD is None:
         return False
-    user_ok = hmac.compare_digest(auth.username or "", USERNAME)
-    pass_ok = hmac.compare_digest(auth.password or "", PASSWORD)
+    user_ok = hmac.compare_digest((auth.username or "").encode(), USERNAME.encode())
+    pass_ok = hmac.compare_digest((auth.password or "").encode(), PASSWORD.encode())
     return user_ok and pass_ok
 
 
 @app.before_request
 def require_login():
+    if request.path in ('/pair', '/pair-info'):
+        return None
     if not is_authorized(request.authorization):
         return Response(
             "Login required.",
             401,
             {"WWW-Authenticate": 'Basic realm="Ducky Cam Web"'},
         )
+
+
+@app.get('/pair-info')
+def pair_info():
+    global pair_token, pair_started
+    with pair_lock:
+        if PASSWORD is not None:
+            return jsonify(paired=True, session=session_id), 410
+        if time.monotonic() - pair_started > 600:
+            pair_token = secrets.token_urlsafe(32)
+            pair_started = time.monotonic()
+        return jsonify(paired=False, token=pair_token, session=session_id)
+
+
+@app.post('/pair')
+def pair():
+    global PASSWORD, reconnect_key
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(error='Expected pairing object'), 400
+    token, password = payload.get('token'), payload.get('password')
+    if not isinstance(token, str) or not isinstance(password, str) or not 8 <= len(password) <= 128:
+        return jsonify(error='Choose an 8–128 character password in the listener.'), 400
+    with pair_lock:
+        if not hmac.compare_digest(token.encode(), pair_token.encode()):
+            return jsonify(error='Pairing token rejected'), 403
+        if PASSWORD is not None:
+            if not hmac.compare_digest(PASSWORD.encode(), password.encode()):
+                return jsonify(error='Already paired; restart the server to choose a new password.'), 410
+        elif time.monotonic() - pair_started > 600:
+            return jsonify(error='Pairing token expired; refresh discovery.'), 403
+        else:
+            PASSWORD = password
+            reconnect_key = discovery_key(password, session_id)
+            if tunnel:
+                tunnel.changed.set()
+    return jsonify(ok=True, session=session_id)
+
+
+def advertisement(url):
+    global pair_token, pair_started
+    with pair_lock:
+        data = dict(app=APP, url=url, session=session_id, paired=PASSWORD is not None, created=int(time.time()))
+        if PASSWORD is None:
+            pair_token = secrets.token_urlsafe(32)
+            pair_started = time.monotonic()
+            data['token'] = pair_token
+        else:
+            data['signature'] = signature(data, reconnect_key)
+        return data
 
 
 # ---- Streams ---------------------------------------------------------------
@@ -316,7 +355,10 @@ def generate_frames():
             # Read every frame the camera offers but only SEND on schedule, so
             # what goes out is always the freshest frame, never a stale queued
             # one. Reading and discarding is far cheaper than encoding.
-            success, frame = cam.read()
+            with camera_lock:
+                if camera is not cam or video_source != 'camera':
+                    break
+                success, frame = cam.read()
             captured_at = time.monotonic()
             frame_interval = 1.0 / target_fps if target_fps > 0 else 0.0
 
@@ -411,191 +453,74 @@ def generate_frames():
 
 
 def generate_audio():
-    """Audio chunks to one listener for as long as it stays connected. While
-    the mic is OFF we send a zero-length heartbeat once a second so a vanished
-    listener is noticed and cleaned up."""
-    q = queue.Queue(maxsize=64)
-    with subscribers_lock:
-        audio_subscribers.append(q)
-    log("Audio listener connected.")
-    try:
-        while True:
-            try:
-                yield q.get(timeout=1.0)
-            except queue.Empty:
-                yield AUDIO_HEADER.pack(time.monotonic(), 0, 0)
-    finally:
-        with subscribers_lock:
-            if q in audio_subscribers:
-                audio_subscribers.remove(q)
-        log("Audio listener disconnected.")
-
-
-INDEX_HTML = """<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ducky Cam</title>
-  <style>
-    body { margin:0; background:#0b0b0d; color:#ddd;
-           font-family: system-ui, sans-serif; text-align:center; }
-    h1 { font-size:1rem; font-weight:600; padding:10px; margin:0;
-         letter-spacing:.05em; color:#8f8; }
-    img { max-width:100%; height:auto; display:block; margin:0 auto; }
-    .bar { padding:10px; display:flex; gap:10px; justify-content:center; }
-    button { background:#1c1c22; color:#ddd; border:1px solid #444;
-             border-radius:6px; padding:8px 14px; font-size:.95rem; }
-    button.on { border-color:#8f8; color:#8f8; }
-    #st { font-size:.8rem; color:#888; padding-bottom:10px; }
-    select { background:#1c1c22; color:#ddd; border:1px solid #444;
-             border-radius:6px; padding:7px 10px; font-size:.9rem;
-             max-width:44vw; }
-  </style>
-</head>
-<body>
-  <h1>DUCKY CAM &mdash; LIVE</h1>
-  <img src="/video" alt="Live feed">
-  <div class="bar">
-    <button id="listen">&#128264; Listen</button>
-    <button id="mic">&#127908; Mic: ?</button>
-  </div>
-  <div class="bar">
-    <select id="camsel" title="Camera"></select>
-    <select id="micsel" title="Microphone"></select>
-  </div>
-  <div id="st"></div>
-<script>
-// Browser audio: pull /audio (host-stamped PCM chunks) and play it with the
-// Web Audio API. Chunks are queued back-to-back with a small lead so network
-// jitter doesn't cause gaps. viewer.py does the same with proper A/V sync.
-const listenBtn = document.getElementById('listen');
-const micBtn = document.getElementById('mic');
-const st = document.getElementById('st');
-let ctx = null, listening = false, nextTime = 0, abort = null;
-let rate = 16000, channels = 1;
-const LEAD = 0.25;                       // seconds of lead / jitter buffer
-const u = p => new URL(p, location.origin).href;   // origin only, never creds
-
-async function status() {
-  const r = await fetch(u('/status')); const s = await r.json();
-  rate = s.sample_rate; channels = s.channels;
-  micBtn.textContent = '\\u{1F3A4} Mic: ' + (s.mic ? 'ON' : 'OFF');
-  micBtn.className = s.mic ? 'on' : '';
-  return s;
-}
-async function toggleMic() {
-  const s = await status();
-  await fetch(u(s.mic ? '/mic/stop' : '/mic/start'), {method: 'POST'});
-  await status();
-}
-function playChunk(pcm) {
-  const n = pcm.length / channels;
-  const buf = ctx.createBuffer(channels, n, rate);
-  for (let c = 0; c < channels; c++) {
-    const ch = buf.getChannelData(c);
-    for (let i = 0; i < n; i++) ch[i] = pcm[i * channels + c] / 32768;
-  }
-  const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination);
-  const now = ctx.currentTime;
-  if (nextTime < now + 0.02) nextTime = now + LEAD;   // (re)start with lead
-  src.start(nextTime); nextTime += buf.duration;
-}
-async function listen() {
-  if (listening) { abort.abort(); listening = false; listenBtn.textContent = '\\u{1F508} Listen'; listenBtn.className=''; return; }
-  const s = await status();
-  if (!s.mic) { await fetch(u('/mic/start'), {method:'POST'}); await status(); }
-  ctx = ctx || new (window.AudioContext || window.webkitAudioContext)({sampleRate: rate});
-  await ctx.resume();
-  listening = true; listenBtn.textContent = '\\u{1F507} Stop listening'; listenBtn.className='on';
-  abort = new AbortController();
-  let chunks = 0, dropped = 0, lastSeq = null;
-  try {
-    const resp = await fetch(u('/audio'), {signal: abort.signal});
-    const reader = resp.body.getReader();
-    let pending = new Uint8Array(0);
-    while (listening) {
-      const {value, done} = await reader.read(); if (done) break;
-      const merged = new Uint8Array(pending.length + value.length);
-      merged.set(pending); merged.set(value, pending.length); pending = merged;
-      while (pending.length >= 14) {
-        const dv = new DataView(pending.buffer, pending.byteOffset, 14);
-        const seq = dv.getUint32(8), len = dv.getUint16(12);
-        if (pending.length < 14 + len) break;
-        if (len > 0) {
-          if (lastSeq !== null && seq > lastSeq + 1) dropped += seq - lastSeq - 1;
-          lastSeq = seq; chunks++;
-          const bytes = pending.slice(14, 14 + len);
-          playChunk(new Int16Array(bytes.buffer, bytes.byteOffset, len / 2));
-        }
-        pending = pending.slice(14 + len);
-      }
-      if (chunks % 25 === 0) st.textContent = 'audio chunks ' + chunks + ' | dropped ' + dropped + ' | ' + rate + ' Hz';
-    }
-  } catch (e) { if (e.name !== 'AbortError') st.textContent = 'audio error: ' + e; }
-  listening = false; listenBtn.textContent = '\\u{1F508} Listen'; listenBtn.className='';
-}
-listenBtn.onclick = listen; micBtn.onclick = toggleMic;
-
-// Device pickers. The camera list is by index because OpenCV cannot name
-// cameras; microphones report their real names.
-const camSel = document.getElementById('camsel');
-const micSel = document.getElementById('micsel');
-function opt(value, label, selected) {
-  const o = document.createElement('option');
-  o.value = value; o.textContent = label; o.selected = selected;
-  return o;
-}
-async function loadDevices() {
-  try {
-    const d = await (await fetch(u('/devices'))).json();
-    camSel.replaceChildren(...d.cameras.map(c => opt(c.index, c.name, c.index === d.current_camera)));
-    if (!d.cameras.length) camSel.replaceChildren(opt(-1, 'No camera found', true));
-    micSel.replaceChildren(opt(-1, 'Default microphone', d.current_mic === -1),
-      ...d.microphones.map(m => opt(m.index, m.name, m.index === d.current_mic)));
-  } catch (e) { st.textContent = 'could not list devices: ' + e; }
-}
-camSel.onchange = async () => {
-  await fetch(u('/camera/select?index=' + camSel.value), {method: 'POST'});
-  // the old MJPEG stream ended with the old camera, so ask for a new one
-  const img = document.querySelector('img');
-  img.src = u('/video') + '?t=' + Date.now();
-};
-micSel.onchange = async () => {
-  const r = await fetch(u('/mic/select?index=' + micSel.value), {method: 'POST'});
-  const j = await r.json();
-  if (j.sample_rate && j.sample_rate !== rate) {
-    // The audio context is fixed to one rate, so rebuild it for the new mic.
-    rate = j.sample_rate;
-    if (listening) { await listen(); ctx = null; nextTime = 0; await listen(); }
-    else { ctx = null; }
-  }
-  await status();
-};
-loadDevices();
-status(); setInterval(status, 5000);
-</script>
-</body>
-</html>
-"""
+    yield from mixer.stream()
 
 
 @app.route("/")
 def index():
-    return INDEX_HTML
+    return (Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "page.html").read_text(encoding="utf-8")
 
 
 @app.route("/video")
 def video():
-    global camera_wanted
-    camera_wanted = True
-    start_camera()
-    if camera is None:
-        return Response("This host has no camera.", 503)
-    return Response(
-        generate_frames(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
+    global camera_wanted, video_source, desktop_wanted
+    if video_source == 'camera':
+        camera_wanted = True
+        start_camera()
+        if camera is not None:
+            return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+        video_source = 'desktop'
+        log('No camera: using desktop video instead.')
+    desktop_wanted = True
+    selected = monitor_id
+    monitors = list_monitors()
+    if selected not in [m['id'] for m in monitors]:
+        return jsonify(error='Selected monitor unavailable; refresh displays.'), 404
+    return Response(desktop_frames(selected, lambda: desktop_wanted and video_source == 'desktop'
+                                   and monitor_id == selected and not shutdown.is_set()),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.get('/monitors')
+def monitors():
+    return jsonify(monitors=list_monitors(), selected=monitor_id)
+
+
+@app.post('/source/select')
+def source_select():
+    global video_source, monitor_id, desktop_wanted, camera_wanted
+    source = request.args.get('source', video_source)
+    if source not in ('camera', 'desktop'):
+        return jsonify(error='source must be camera or desktop'), 400
+    try:
+        selected = int(request.args.get('monitor', monitor_id))
+    except (TypeError, ValueError):
+        return jsonify(error='monitor must be a whole number'), 400
+    if source == 'desktop' and selected not in [m['id'] for m in list_monitors()]:
+        return jsonify(error='Monitor unavailable; refresh displays.'), 404
+    video_source, monitor_id = source, selected
+    desktop_wanted = source == 'desktop'
+    camera_wanted = source == 'camera'
+    if source == 'desktop':
+        stop_camera()
+    elif camera is None:
+        start_camera()
+    return jsonify(source=video_source, monitor=monitor_id, camera=camera is not None)
+
+
+@app.post('/desktop-audio/start')
+def desktop_audio_start():
+    try:
+        mixer.set_desktop(True)
+        return jsonify(desktop_audio=True)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return jsonify(desktop_audio=False, error=str(exc)), 503
+
+
+@app.post('/desktop-audio/stop')
+def desktop_audio_stop():
+    mixer.set_desktop(False)
+    return jsonify(desktop_audio=False)
 
 
 @app.route("/audio")
@@ -662,14 +587,15 @@ def list_microphones():
 @app.route("/devices")
 def devices():
     return jsonify(
-        cameras=[{"index": i, "name": "Camera " + str(i)} for i in list_cameras()],
+        cameras=[{"index": i, "name": "Camera " + str(i)} for i in (list_cameras() if request.args.get("probe") == "1" else (_camera_probe or [CAMERA_INDEX]))],
         microphones=list_microphones(),
+        monitors=list_monitors(), source=video_source, monitor=monitor_id,
         current_camera=CAMERA_INDEX,
         current_mic=MIC_DEVICE if MIC_DEVICE is not None else -1,
     )
 
 
-@app.route("/camera/select", methods=["GET", "POST"])
+@app.route("/camera/select", methods=["POST"])
 def camera_select():
     """Switch to another camera, restarting it only if it was already on."""
     global CAMERA_INDEX
@@ -686,7 +612,7 @@ def camera_select():
                    ok=bool(started))
 
 
-@app.route("/mic/select", methods=["GET", "POST"])
+@app.route("/mic/select", methods=["POST"])
 def mic_select():
     """Switch to another microphone. -1 or blank means the system default."""
     global MIC_DEVICE
@@ -702,10 +628,10 @@ def mic_select():
     log("Microphone selection set to " + (str(index) if index is not None else "default") + ".")
     return jsonify(current_mic=MIC_DEVICE if MIC_DEVICE is not None else -1,
                    mic=mic_stream is not None, ok=bool(started),
-                   sample_rate=SAMPLE_RATE)
+                   sample_rate=RATE)
 
 
-@app.route("/start", methods=["GET", "POST"])
+@app.route("/start", methods=["POST"])
 def start():
     global camera_wanted
     camera_wanted = True
@@ -713,24 +639,25 @@ def start():
     return jsonify(active=camera is not None, changed=changed)
 
 
-@app.route("/stop", methods=["GET", "POST"])
+@app.route("/stop", methods=["POST"])
 def stop():
-    global camera_wanted
+    global camera_wanted, desktop_wanted
+    desktop_wanted = False
     camera_wanted = False
     changed = stop_camera()
     return jsonify(active=camera is not None, changed=changed)
 
 
-@app.route("/mic/start", methods=["GET", "POST"])
+@app.route("/mic/start", methods=["POST"])
 def mic_start():
     global mic_wanted
     mic_wanted = True
     changed = start_mic()
     return jsonify(mic=mic_stream is not None, changed=changed,
-                   sample_rate=SAMPLE_RATE, channels=CHANNELS)
+                   sample_rate=RATE, channels=MIX_CHANNELS)
 
 
-@app.route("/mic/stop", methods=["GET", "POST"])
+@app.route("/mic/stop", methods=["POST"])
 def mic_stop():
     global mic_wanted
     mic_wanted = False
@@ -740,75 +667,15 @@ def mic_stop():
 
 @app.route("/status")
 def status():
-    return jsonify(active=camera is not None, mic=mic_stream is not None,
-                   sample_rate=SAMPLE_RATE, channels=CHANNELS)
+    return jsonify(active=camera is not None or desktop_wanted, mic=mic_stream is not None,
+                   sample_rate=RATE, channels=MIX_CHANNELS, source=video_source, monitor=monitor_id,
+                   desktop_audio=mixer.desktop_subscription is not None, audio_error=mixer.error,
+                   session=tunnel.session if tunnel else session_id)
 
 
 @app.route("/logs")
 def logs():
     return jsonify(lines=list(LOG_BUFFER))
-
-
-# ---- Tunnel + mailbox (unchanged from Ducky Cam Web v2.0) -------------------
-def open_public_tunnel(port):
-    """Open a Cloudflare quick tunnel and return the public https URL, or None.
-    Quick tunnels need NO account and NO token."""
-    # Catch Exception, not just ImportError: a PyInstaller build that misses
-    # pycloudflared's bundled data files fails here with FileNotFoundError,
-    # which used to kill this thread outright and leave the host running with
-    # no tunnel and no explanation.
-    try:
-        from pycloudflared import try_cloudflare
-    except Exception as exc:  # noqa: BLE001
-        log(f"pycloudflared unavailable: {exc}")
-        return None
-    try:
-        return try_cloudflare(port=port).tunnel
-    except Exception as exc:  # noqa: BLE001
-        log(f"Could not open Cloudflare tunnel: {exc}")
-        return None
-
-
-def publish_url_to_mailbox(url):
-    if not PUBLISH_TO_MAILBOX or not NTFY_TOPIC:
-        return False
-    req = urllib.request.Request(
-        f"https://ntfy.sh/{NTFY_TOPIC}",
-        data=url.encode(),
-        method="POST",
-        headers={"Title": "roomcam-url", "User-Agent": "room-cam-web-audio"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            ok = resp.status == 200
-        if ok:
-            log(f"Published public URL to mailbox: {url}")
-        return ok
-    except Exception as exc:  # noqa: BLE001
-        log(f"Could not publish URL to mailbox: {exc}")
-        return False
-
-
-def _startup_tunnel_and_publish():
-    try:
-        public_url = open_public_tunnel(PORT)
-    except Exception:  # noqa: BLE001 - a dead thread here must not be silent
-        public_url = None
-        log(f"Tunnel thread failed:\n{traceback.format_exc()}")
-    if not public_url:
-        log("No public tunnel -> serving on the local network only.")
-        report_fatal(
-            "The internet tunnel could not be opened, so there is no public "
-            "address for this camera.\n\nThe camera is still reachable on your "
-            f"local network at port {PORT}.",
-            "\n".join(LOG_BUFFER),
-            title="Ducky Cam Web: no public address",
-        )
-        return
-    log(f"PUBLIC url: {public_url}  (log in {USERNAME} / {PASSWORD})")
-    while True:
-        publish_url_to_mailbox(public_url)
-        time.sleep(REPUBLISH_SECONDS)
 
 
 # ---- Config (promptable; never edit code) ----------------------------------
@@ -817,6 +684,8 @@ CONFIG_SECTION = "roomcam"
 
 
 def _config_path():
+    if os.environ.get("ROOMCAM_CONFIG"):
+        return os.environ["ROOMCAM_CONFIG"]
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
@@ -843,7 +712,8 @@ def report_fatal(summary, detail="", title="Ducky Cam Web could not start"):
             fh.write(f"\n===== {stamp} =====\n{summary}\n{detail}\n")
     except OSError:
         path = "(could not write a log file)"
-    print(f"{summary}\n{detail}")
+    if sys.stdout is not None:
+        print(f"{summary}\n{detail}")
     if not _has_console():
         try:
             import tkinter as tk
@@ -858,30 +728,8 @@ def report_fatal(summary, detail="", title="Ducky Cam Web could not start"):
             pass
 
 
-def _ask(prompt_text, default):
-    """Console prompt when there is a console, a pop-up for the no-console
-    exe, else the default."""
-    if _has_console():
-        try:
-            return input(f"{prompt_text} [{default}]: ").strip() or default
-        except EOFError:
-            return default
-    try:
-        import tkinter as tk
-        from tkinter import simpledialog
-        root = tk.Tk()
-        root.withdraw()
-        entered = simpledialog.askstring(
-            "Ducky Cam Web setup", prompt_text, initialvalue=default
-        )
-        root.destroy()
-        return (entered or default).strip()
-    except Exception:
-        return default
-
-
 def load_config():
-    """env var -> .ini -> first-run prompt -> default; then write the .ini."""
+    """Read optional device/network settings. Passwords are listener-owned."""
     path = _config_path()
     # interpolation=None: without it, configparser treats "%" as a variable
     # reference, so a password containing one raises ValueError on write and
@@ -894,7 +742,6 @@ def load_config():
 
     defaults = {
         "username": DEFAULT_USERNAME,
-        "password": DEFAULT_PASSWORD,
         "topic": DEFAULT_TOPIC,
         "port": str(DEFAULT_PORT),
         "camera_index": str(DEFAULT_CAMERA_INDEX),
@@ -918,18 +765,6 @@ def load_config():
         else:
             values[key] = dflt
 
-    if not os.path.exists(path) and values["password"] == DEFAULT_PASSWORD:
-        values["password"] = _ask(
-            "Set a viewer password (gates internet access)", DEFAULT_PASSWORD
-        )
-
-    for key in defaults:
-        cfg.set(CONFIG_SECTION, key, str(values[key]))
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            cfg.write(fh)
-    except OSError as exc:
-        log(f"Could not write config {path}: {exc}")
     return values
 
 
@@ -953,7 +788,7 @@ def main():
 
     _cfg = load_config()
     USERNAME = _cfg["username"]
-    PASSWORD = _cfg["password"]
+    PASSWORD = None
     NTFY_TOPIC = _cfg["topic"]
     PORT = _setting(_cfg, "port", int, "a whole number")
     CAMERA_INDEX = _setting(_cfg, "camera_index", int, "a whole number")
@@ -971,27 +806,66 @@ def main():
     log("Ducky Cam Web with Audio starting. Camera + mic OFF until a viewer connects.")
     log(f"Config file: {_config_path()}")
     log("Change settings there or via ROOMCAM_* env vars -- no code edits.")
-    if PASSWORD == DEFAULT_PASSWORD:
-        log("WARNING: password is still the public demo value -- set a real one "
-            "in the config file before relying on internet access.")
-
+    parser = argparse.ArgumentParser(description='Camera and desktop sharing host')
+    parser.add_argument('--local', action='store_true', help='Loopback only; no public tunnel')
+    parser.add_argument('--port', type=int)
+    parser.add_argument('--session-file', help='Write local test address')
+    parser.add_argument('--stop-after', type=float, default=0)
+    args = parser.parse_args()
+    if args.local:
+        ENABLE_TUNNEL = False
+    if args.port is not None:
+        PORT = args.port
+    web = make_server('127.0.0.1' if ENABLE_TUNNEL or args.local else '0.0.0.0', PORT, app, threaded=True)
+    PORT = web.server_port
+    if args.session_file:
+        Path(args.session_file).write_text(json.dumps({'url': f'http://127.0.0.1:{PORT}'}))
+    global tunnel
+    network = None
     if ENABLE_TUNNEL:
-        threading.Thread(target=_startup_tunnel_and_publish, daemon=True).start()
-    else:
-        log("Tunnel disabled in config -> local network only.")
-
+        tunnel = Tunnel(PORT, NTFY_TOPIC, None, log, advertisement, session_id)
+        network = threading.Thread(target=tunnel.run, daemon=True)
+        network.start()
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    mixer.start()
     try:
-        app.run(host="0.0.0.0", port=PORT, threaded=True)
-    except OSError as exc:
-        # WSAEADDRINUSE on Windows, EADDRINUSE on Linux.
-        if getattr(exc, "winerror", None) == 10048 or getattr(exc, "errno", None) in (48, 98):
-            raise SystemExit(
-                f"Port {PORT} is already in use, so the server could not start.\n\n"
-                "Another copy of Ducky Cam is probably already running -- check "
-                "Task Manager for webcam_server.exe and end it, or set a "
-                f"different 'port' in {_config_path()}."
-            )
-        raise
+        run_tray(args.stop_after)
+    finally:
+        shutdown.set()
+        stop_camera()
+        stop_mic()
+        mixer.close()
+        if tunnel:
+            tunnel.close()
+            network.join(timeout=15)
+        web.shutdown()
+        web.server_close()
+
+
+def run_tray(stop_after=0):
+    import pystray
+    from PIL import Image, ImageDraw
+    image = Image.new('RGB', (64, 64), '#172b3a')
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((10, 12, 54, 45), outline='#65e3a0', width=4)
+    draw.ellipse((24, 22, 40, 38), fill='#65e3a0')
+    def stop(icon=None, item=None):
+        shutdown.set()
+        if icon:
+            icon.stop()
+    icon = pystray.Icon('roomcam', image, 'RoomCam ready',
+                        menu=pystray.Menu(pystray.MenuItem('Stop sharing', stop)))
+    def setup(tray):
+        tray.visible = True
+        if stop_after:
+            timer = threading.Timer(stop_after, lambda: stop(tray))
+            timer.daemon = True
+            timer.start()
+        while not shutdown.wait(.5):
+            active = camera is not None or desktop_wanted or mic_stream is not None or mixer.desktop_subscription is not None
+            state = f'LIVE: {video_source}; mic {"on" if mic_stream else "off"}; desktop audio {"on" if mixer.desktop_subscription else "off"}' if active else (tunnel.status if tunnel else 'Local ready')
+            tray.title = ('RoomCam - ' + state)[:127]
+    icon.run(setup=setup)
 
 
 if __name__ == "__main__":

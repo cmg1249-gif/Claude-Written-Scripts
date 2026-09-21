@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RoomCam · Camera & Desktop</title>
+<style>
+body{margin:0;background:#101820;color:#edf4f8;font:15px system-ui,sans-serif}main{max-width:1200px;margin:auto;padding:24px}h1{font-size:24px;margin:0 0 8px}p{color:#b4c5d0}.controls{display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin:20px 0}label{display:grid;gap:6px;font-size:13px;color:#b4c5d0}button,select{background:#213441;border:1px solid #4b6475;border-radius:7px;color:#fff;padding:10px;font:inherit}button{cursor:pointer}button.on{background:#235a43;border-color:#65e3a0}#feed{width:100%;max-height:70vh;object-fit:contain;background:#080d12;min-height:200px;border-radius:10px}#status{min-height:24px}#error{color:#ffbead;white-space:pre-wrap}.hint{font-size:13px}button:focus-visible,select:focus-visible{outline:3px solid #65e3a0}#stop{border-color:#da8b79}
+</style></head><body><main>
+<h1>RoomCam · Camera & Desktop</h1><p>Select a view. Listen to the microphone, desktop speakers, or both.</p>
+<div class="controls">
+<label>Video source<select id="source"><option value="camera">Camera</option><option value="desktop">Desktop</option></select></label>
+<label>Camera<select id="camera"></select></label><label>Monitor<select id="monitor"></select></label>
+<button id="refresh">Refresh devices</button></div>
+<img id="feed" alt="Live camera or desktop stream">
+<div class="controls"><button id="listen">Listen</button><button id="mic">Microphone: off</button><button id="desktop">Desktop audio: off</button>
+<label>Microphone device<select id="microphone"></select></label><button id="stop">Stop all capture</button></div>
+<p id="status" role="status">Connecting…</p><p id="error" role="alert"></p>
+<p class="hint">Use the Windows viewer to record the selected view and combined audio. Stop sharing from the host’s tray menu to close the server.</p>
+<script>
+const $=id=>document.getElementById(id);let state={},ctx=null,abort=null,listening=false,nextTime=0;
+const sources=new Set();
+async function api(path,post=false){const r=await fetch(path,{method:post?'POST':'GET'});const data=await r.json();if(!r.ok)throw Error(data.error||r.statusText);return data;}
+function fail(e){$('error').textContent=e.message||String(e);}
+function options(id,items,selected){$(id).replaceChildren(...items.map(item=>{const o=document.createElement('option');o.value=item.id;o.textContent=item.name;o.selected=String(item.id)===String(selected);return o;}));}
+async function refresh(probe=false){const d=await api('/devices'+(probe?'?probe=1':''));options('camera',d.cameras.map(c=>({id:c.index,name:c.name})),d.current_camera);options('monitor',d.monitors.map(m=>({id:m.id,name:m.name+' · '+m.width+' × '+m.height})),d.monitor);options('microphone',[{id:-1,name:'System default'},...d.microphones.map(m=>({id:m.index,name:m.name}))],d.current_mic);$('source').value=d.source;}
+function reloadVideo(){$('feed').src='/video?t='+Date.now();}
+async function status(){state=await api('/status');$('mic').textContent='Microphone: '+(state.mic?'on':'off');$('mic').classList.toggle('on',state.mic);$('desktop').textContent='Desktop audio: '+(state.desktop_audio?'on':'off');$('desktop').classList.toggle('on',state.desktop_audio);$('status').textContent=(state.active?'Live · ':'Ready · ')+state.source+(state.source==='desktop'?' · monitor '+state.monitor:'')+' · '+state.sample_rate/1000+' kHz stereo';if(state.audio_error)fail(state.audio_error);return state;}
+async function selectView(){await api('/source/select?source='+$('source').value+'&monitor='+($('monitor').value||1),true);reloadVideo();await status();}
+function stopListening(){listening=false;if(abort)abort.abort();for(const source of sources){try{source.stop();}catch{}}sources.clear();nextTime=0;$('listen').textContent='Listen';$('listen').classList.remove('on');}
+function play(pcm){const channels=2,rate=48000,n=pcm.length/channels;const buffer=ctx.createBuffer(channels,n,rate);for(let c=0;c<channels;c++){const output=buffer.getChannelData(c);for(let i=0;i<n;i++)output[i]=pcm[i*channels+c]/32768;}if(nextTime>ctx.currentTime+2)return;const node=ctx.createBufferSource();node.buffer=buffer;node.connect(ctx.destination);node.onended=()=>{sources.delete(node);node.disconnect();};sources.add(node);nextTime=Math.max(nextTime,ctx.currentTime+.15);node.start(nextTime);nextTime+=buffer.duration;}
+async function listen(){if(listening){stopListening();return;}ctx=ctx||new AudioContext();await ctx.resume();listening=true;$('listen').textContent='Mute playback';$('listen').classList.add('on');abort=new AbortController();try{const r=await fetch('/audio',{signal:abort.signal});if(!r.ok)throw Error('Audio connection failed: '+r.status);const reader=r.body.getReader();let pending=new Uint8Array();while(listening){const {value,done}=await reader.read();if(done)break;const merged=new Uint8Array(pending.length+value.length);merged.set(pending);merged.set(value,pending.length);pending=merged;while(pending.length>=14){const view=new DataView(pending.buffer,pending.byteOffset,14),size=view.getUint16(12);if(size%4)throw Error('Invalid stereo audio packet');if(pending.length<14+size)break;if(size){const bytes=pending.slice(14,14+size);play(new Int16Array(bytes.buffer));}pending=pending.slice(14+size);}}}catch(e){if(e.name!=='AbortError')fail(e);}finally{stopListening();}}
+function action(id,fn){$(id).onclick=()=>{$('error').textContent='';Promise.resolve().then(fn).catch(fail);};}
+$('source').onchange=()=>selectView().catch(fail);$('monitor').onchange=()=>{$('source').value='desktop';selectView().catch(fail);};
+$('camera').onchange=async()=>{try{await api('/camera/select?index='+$('camera').value,true);$('source').value='camera';await selectView();}catch(e){fail(e);}};
+$('microphone').onchange=()=>api('/mic/select?index='+$('microphone').value,true).then(status).catch(fail);
+action('refresh',()=>refresh(true));action('listen',listen);action('mic',async()=>{await status();await api(state.mic?'/mic/stop':'/mic/start',true);await status();});action('desktop',async()=>{await status();await api(state.desktop_audio?'/desktop-audio/stop':'/desktop-audio/start',true);await status();});
+action('stop',async()=>{stopListening();$('feed').removeAttribute('src');await api('/stop',true);await api('/mic/stop',true);await api('/desktop-audio/stop',true);await status();});
+refresh().then(()=>{reloadVideo();return status();}).catch(fail);setInterval(()=>status().catch(fail),5000);window.addEventListener('pagehide',stopListening);
+</script></main></body></html>

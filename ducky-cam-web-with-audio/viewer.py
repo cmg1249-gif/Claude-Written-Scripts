@@ -38,6 +38,9 @@ import base64
 import configparser
 import datetime
 import getpass
+from connection import decode_advertisement
+from tls import HTTPS_CONTEXT
+from retry import retry_delay
 import json
 import os
 import random
@@ -159,7 +162,7 @@ AUDIO_HEADER = struct.Struct("!dIH")
 DTYPE = "int16"
 
 # ---- Viewer behaviour ------------------------------------------------------
-MIC_ON_AT_CONNECT = True
+MIC_ON_AT_CONNECT = False
 PREBUFFER_SECONDS = 1.0         # audio held before playback starts. Cloudflare
                                 # quick tunnels deliver audio in bursts and can
                                 # stall for a second or more, so this is much
@@ -202,25 +205,25 @@ def load_settings():
     topic = get("topic", DEFAULT_TOPIC)
     username = get("username", DEFAULT_USERNAME)
     password = get("password", "")
-    if not password:
+    while not 8 <= len(password) <= 128:
         try:
             password = getpass.getpass(
-                f"Host password for user '{username}' (set on the host): "
+                'Choose a stream password (8–128 characters, set here in the listener): '
             )
         except (EOFError, KeyboardInterrupt):
-            password = ""
+            raise SystemExit('Password entry cancelled.')
     return topic, username, password
 
 
 # ---- Mailbox (unchanged from Ducky Cam Web v2.0) ----------------------------
-def fetch_url_from_mailbox(topic):
+def fetch_url_from_mailbox(topic, password, session=None):
     req = urllib.request.Request(
-        f"https://ntfy.sh/{topic}/json?poll=1&since=12h",
+        f"https://ntfy.sh/{topic}/json?poll=1&since=15m",
         headers={"User-Agent": "room-cam-web-audio"},
     )
     latest = None
     latest_time = -1
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=15, context=HTTPS_CONTEXT) as resp:
         for line in resp.read().decode().splitlines():
             line = line.strip()
             if not line:
@@ -233,30 +236,59 @@ def fetch_url_from_mailbox(topic):
                 continue
             msg = (obj.get("message") or "").strip()
             when = obj.get("time", 0)
-            if msg.startswith("http") and when >= latest_time:
+            advert = decode_advertisement(msg, password, session)
+            if advert and when >= latest_time:
                 latest_time = when
-                latest = msg
+                latest = advert["url"]
     return latest
 
 
 # ---- Host control ----------------------------------------------------------
 class Host:
-    def __init__(self, base, username, password):
+    def __init__(self, base, username, password, topic=None):
         self.base = base.rstrip("/")
+        self.topic, self.password = topic, password
+        self.session = None
+        self.reconnect_lock = threading.Lock()
+        self.last_discovery = 0
         self.auth = "Basic " + base64.b64encode(
             f"{username}:{password}".encode()
         ).decode()
+
+    def pair(self):
+        """Set the session password from the listener; retries are idempotent."""
+        try:
+            with urllib.request.urlopen(self.base+'/pair-info', timeout=15, context=HTTPS_CONTEXT) as response:
+                info = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 410:
+                if self.api('/status', quiet=True) is not None:
+                    return
+                raise RuntimeError('Server is already paired. Restart it to choose a different password.') from exc
+            raise
+        request = urllib.request.Request(self.base+'/pair', method='POST',
+            data=json.dumps({'token':info['token'], 'password':self.password}).encode(),
+            headers={'Content-Type':'application/json'})
+        with urllib.request.urlopen(request, timeout=15, context=HTTPS_CONTEXT) as response:
+            result=json.loads(response.read())
+        if not result.get('ok'):
+            raise RuntimeError('Pairing failed')
+        self.session=result['session']
 
     def api(self, path, quiet=False):
         """Call a control endpoint. Returns the JSON, or None (see last_error:
         'auth' = wrong password, 'net' = unreachable / timed out)."""
         req = urllib.request.Request(
-            f"{self.base}{path}", headers={"Authorization": self.auth}
+            f"{self.base}{path}", headers={"Authorization": self.auth},
+            method="GET" if path.split("?")[0] in ("/status", "/devices", "/logs", "/monitors") else "POST"
         )
         self.last_error = None
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read().decode())
+            with urllib.request.urlopen(req, timeout=15, context=HTTPS_CONTEXT) as resp:
+                result = json.loads(resp.read().decode())
+                if path == "/status":
+                    self.session = result.get("session") or self.session
+                return result
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
                 self.last_error = "auth"
@@ -285,11 +317,27 @@ class Host:
             time.sleep(delay)
         return None
 
+    def rediscover(self):
+        if not self.topic or not self.session:
+            return
+        with self.reconnect_lock:
+            if time.monotonic() - self.last_discovery < 5:
+                return
+            self.last_discovery = time.monotonic()
+            try:
+                url = fetch_url_from_mailbox(self.topic, self.password, self.session)
+                if url:
+                    self.base = url
+            except (OSError, ValueError) as exc:
+                self.last_discovery += max(0, retry_delay(exc) - 5)
+
     def open_stream(self, path):
-        req = urllib.request.Request(
-            f"{self.base}{path}", headers={"Authorization": self.auth}
-        )
-        return urllib.request.urlopen(req, timeout=20)
+        req = urllib.request.Request(f'{self.base}{path}', headers={'Authorization': self.auth})
+        try:
+            return urllib.request.urlopen(req, timeout=20, context=HTTPS_CONTEXT)
+        except OSError:
+            self.rediscover()
+            raise
 
 
 def stream_host_logs(host, stop_event):
@@ -435,31 +483,30 @@ def read_exact(resp, n):
 def audio_reader(host, clock, wav, recorder, stop_event):
     while not stop_event.is_set():
         try:
-            resp = host.open_stream("/audio")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[viewer] audio connect failed: {exc}")
-            time.sleep(2.0)
-            continue
-        with resp:
-            while not stop_event.is_set():
-                hdr = read_exact(resp, AUDIO_HEADER.size)
-                if hdr is None:
-                    break
-                ts, seq, nbytes = AUDIO_HEADER.unpack(hdr)
-                if nbytes == 0:
-                    clock.reset()
-                    continue
-                pcm = read_exact(resp, nbytes)
-                if pcm is None:
-                    break
-                clock.push(ts, seq, pcm)
-                if wav:
-                    wav.writeframes(pcm)
-                if recorder:
-                    recorder.write_audio(pcm)
+            with host.open_stream('/audio') as resp:
+                while not stop_event.is_set():
+                    hdr = read_exact(resp, AUDIO_HEADER.size)
+                    if hdr is None:
+                        break
+                    ts, seq, nbytes = AUDIO_HEADER.unpack(hdr)
+                    if nbytes == 0:
+                        clock.reset()
+                        continue
+                    if nbytes % (clock.channels * 2):
+                        raise ValueError('Invalid PCM frame alignment')
+                    pcm = read_exact(resp, nbytes)
+                    if pcm is None or stop_event.is_set():
+                        break
+                    clock.push(ts, seq, pcm)
+                    if wav:
+                        wav.writeframes(pcm)
+                    if recorder:
+                        recorder.write_audio(pcm)
+        except (OSError, ValueError) as exc:
+            print(f'[viewer] audio unavailable; retrying: {exc}')
+            host.rediscover()
         if not stop_event.is_set():
-            print("[viewer] audio stream ended; reconnecting...")
-            time.sleep(1.0)
+            stop_event.wait(2)
 
 
 # ---- Video: MJPEG parser ---------------------------------------------------
@@ -473,9 +520,7 @@ def video_reader(host, frames, frames_lock, stop_event, counters):
         except Exception as exc:  # noqa: BLE001
             failures += 1
             print(f"[viewer] video connect failed ({failures}/5): {exc}")
-            if failures >= 5:
-                counters["video_error"] = True
-                return
+            host.rediscover()
             time.sleep(3.0)
             continue
         got_any = False
@@ -518,9 +563,7 @@ def video_reader(host, frames, frames_lock, stop_event, counters):
             break
         if not got_any:
             failures += 1
-            if failures >= 5:
-                counters["video_ended"] = True
-                return
+            host.rediscover()
         print("[viewer] video stream ended; reconnecting...")
         time.sleep(2.0)
 
@@ -866,7 +909,13 @@ def main():
     ap.add_argument("--format", choices=sorted(RECORD_FORMATS), default=DEFAULT_RECORD_FORMAT,
                     help="recording container (default: mp4)")
     ap.add_argument("--device", type=int, default=None, help="speaker device index")
+    ap.add_argument("--source", choices=("camera", "desktop"), default="camera")
+    ap.add_argument("--monitor", type=int, default=1)
+    ap.add_argument("--mute", action="store_true", help="Mute local playback")
+    ap.add_argument("--headless", action="store_true", help="Decode without a window; requires --seconds")
     args = ap.parse_args()
+    if args.headless and not args.seconds:
+        ap.error("--headless requires --seconds")
 
     topic, username, password = load_settings()
 
@@ -874,33 +923,43 @@ def main():
         url = args.url
     else:
         print("Reading the rendezvous mailbox (ntfy)...")
-        try:
-            url = fetch_url_from_mailbox(topic)
-        except Exception as exc:  # noqa: BLE001
-            print(f"Couldn't read the mailbox: {exc}")
-            return
-        if not url:
-            print("No URL in the mailbox yet.")
-            print("Start webcam_server.py on the host, wait a few seconds, re-run this.")
-            return
+        url = None
+        while not url:
+            try:
+                url = fetch_url_from_mailbox(topic, password)
+                if not url:
+                    print('Waiting for a matching host. Check that both passwords match.')
+                    time.sleep(5)
+            except (OSError, ValueError) as exc:
+                print(f'Discovery unavailable; retrying: {exc}')
+                time.sleep(retry_delay(exc))
     print(f"Host is live at: {url}")
 
+    host = Host(url, username, password, topic=None if args.url else topic)
+    while True:
+        try:
+            host.pair()
+            break
+        except OSError as exc:
+            print(f'Pairing unavailable; retrying: {exc}')
+            time.sleep(retry_delay(exc))
+            if not args.url:
+                updated = fetch_url_from_mailbox(topic, password)
+                if updated:
+                    host.base = updated
     if args.browser:
-        print("Opening it in your browser. Use the Listen / Mic buttons on the page.")
-        webbrowser.open(url)
+        print('Paired. In the browser use username '+username+' and the password you chose here.')
+        webbrowser.open(host.base)
         return
-
-    host = Host(url, username, password)
     status = host.wait_until_reachable()
     if status is None:
         print("Found the host's URL but couldn't reach it. If the host just "
               "started, wait a moment and try again.")
         return
-    if status.get("active"):
-        print("Host camera is already ON.")
-    else:
-        print("Host camera is OFF -> turning it ON...")
-        host.api("/start")
+    host.api(f'/source/select?source={args.source}&monitor={args.monitor}')
+    desktop_on = bool(status.get('desktop_audio'))
+    selected_source = args.source
+    selected_monitor = args.monitor
     mic_on = bool(status.get("mic"))
     if mic_on:
         print("Host mic is already ON.")
@@ -937,7 +996,8 @@ def main():
 
     def speaker_callback(outdata, frames_n, time_info, status_flags):
         nbytes = frames_n * 2 * channels
-        outdata[:] = np.frombuffer(clock.pull(nbytes), dtype=DTYPE).reshape(frames_n, channels)
+        pcm = clock.pull(nbytes)
+        outdata[:] = 0 if args.mute else np.frombuffer(pcm, dtype=DTYPE).reshape(frames_n, channels)
 
     def _open_speaker(rate_hz, chans, device):
         """Open the speaker at a given rate. Reopened if a different mic is
@@ -955,6 +1015,11 @@ def main():
             return None
 
     speaker = _open_speaker(rate, channels, args.device)
+    if speaker is None:
+        def silent_playback():
+            while not stop_event.wait(.02):
+                clock.pull(int(clock.rate * .02) * channels * 2)
+        threading.Thread(target=silent_playback, daemon=True).start()
 
     threading.Thread(
         target=audio_reader, args=(host, clock, wav, recorder, stop_event), daemon=True
@@ -972,6 +1037,7 @@ def main():
     ).start()
 
     device_info = host.api("/devices", quiet=True) or {}
+    selected_source = device_info.get('source', selected_source)
     cameras = [c["index"] for c in device_info.get("cameras", [])]
     mics = [-1] + [m["index"] for m in device_info.get("microphones", [])]
     mic_names = {m["index"]: m["name"] for m in device_info.get("microphones", [])}
@@ -981,9 +1047,11 @@ def main():
     if len(mics) > 1:
         print(f"Microphones on the host: {len(mics) - 1} found")
 
+    monitors = [m["id"] for m in device_info.get("monitors", [])]
+    print("v = camera/desktop | b = next monitor | o = desktop audio | space = local mute | f = refresh devices")
     print("Live. Keys:  r = record on/off  |  m = mic on/off  |  c = next camera")
     print("             n = next mic  |  q = quit + all off  |  l = quit, leave on")
-    shut_down = False
+    shut_down = True
     started = time.monotonic()
     last_report = started
     window = "Ducky Cam Web with Audio"
@@ -998,8 +1066,10 @@ def main():
         if event == cv2.EVENT_LBUTTONDOWN and _in_button(x, y):
             handle_toggle()
 
-    cv2.namedWindow(window)
-    cv2.setMouseCallback(window, on_mouse)
+    if not args.headless:
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window, 1100, 750)
+        cv2.setMouseCallback(window, on_mouse)
     current_cam = device_info.get("current_camera", 0)
     cam_pos = cameras.index(current_cam) if current_cam in cameras else 0
     current_mic = device_info.get("current_mic", -1)
@@ -1024,16 +1094,50 @@ def main():
                     recorder.write_video(frame)   # save the clean frame
             # Redraw every loop so the REC button (and its blink/timer) stays
             # live and clickable even between incoming frames.
-            if ui["frame"] is not None:
+            if ui["frame"] is not None and not args.headless:
                 display = ui["frame"].copy()
                 draw_rec_button(display, recorder.recording, recorder.elapsed())
+                cv2.putText(display, f"{selected_source} monitor {selected_monitor} | v: source b: monitor o: desktop audio m: mic",
+                            (10, display.shape[0]-15), cv2.FONT_HERSHEY_SIMPLEX, .45, (0,255,0), 1)
                 cv2.imshow(window, display)
 
-            key = cv2.waitKey(5) & 0xFF
+            if args.headless:
+                time.sleep(.005)
+                key = 255
+            else:
+                key = cv2.waitKey(5) & 0xFF
+                if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            if key == 27:
+                break
+            if key == ord(" "):
+                args.mute = not args.mute
+            if key == ord('f'):
+                updated = host.api('/devices?probe=1') or {}
+                monitors = [m['id'] for m in updated.get('monitors', [])]
+                cameras = [c['index'] for c in updated.get('cameras', [])]
+                mics = [-1] + [m['index'] for m in updated.get('microphones', [])]
+                mic_names.update({m['index']: m['name'] for m in updated.get('microphones', [])})
+                cam_pos = mic_pos = 0
+            if key == ord("v"):
+                selected_source = "desktop" if selected_source == "camera" else "camera"
+                host.api(f"/source/select?source={selected_source}&monitor={selected_monitor}")
+                with frames_lock:
+                    frames.clear()
+            if key == ord("b") and monitors:
+                selected_monitor = monitors[(monitors.index(selected_monitor)+1) % len(monitors)] if selected_monitor in monitors else monitors[0]
+                selected_source = "desktop"
+                host.api(f"/source/select?source=desktop&monitor={selected_monitor}")
+                with frames_lock:
+                    frames.clear()
+            if key == ord("o"):
+                reply = host.api("/desktop-audio/stop" if desktop_on else "/desktop-audio/start")
+                desktop_on = bool(reply and reply.get("desktop_audio"))
             if key == ord("q"):
                 shut_down = True
                 break
             if key == ord("l"):
+                shut_down = False
                 break
             if key == ord("r"):
                 handle_toggle()
@@ -1043,8 +1147,8 @@ def main():
                     mic_on = False
                     print("[viewer] host mic OFF")
                 else:
-                    host.api("/mic/start")
-                    mic_on = True
+                    reply = host.api("/mic/start")
+                    mic_on = bool(reply and reply.get("mic"))
                     print("[viewer] host mic ON")
             if key == ord("c") and len(cameras) > 1:
                 cam_pos = (cam_pos + 1) % len(cameras)
@@ -1095,6 +1199,7 @@ def main():
         print("Turning host camera + mic OFF...")
         host.api("/stop")
         host.api("/mic/stop")
+        host.api("/desktop-audio/stop")
     synced = counters["shown_synced"]
     avg = (counters["sync_error_sum"] / synced * 1000) if synced else 0
     print(

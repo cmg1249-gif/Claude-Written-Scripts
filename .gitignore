@@ -11,3 +11,7 @@ roomcam_config.ini
 roomcam_*.mp4
 roomcam_*.mkv
 roomcam_*.avi
+
+.build/
+*.zip
+release-*/

@@ -8,7 +8,7 @@ matching GitHub release (built with PyInstaller `--onefile`).
 |---------|--------------|-------------|
 | [`ducky-cam/`](ducky-cam) | LAN webcam viewer with zero-config UDP auto-discovery. Camera stays off until a viewer connects; password-gated. | `room-cam-v2.0` |
 | [`ducky-cam-web/`](ducky-cam-web) | Ducky Cam over the internet: tokenless Cloudflare quick tunnel + ntfy.sh rendezvous, promptable config. | `room-cam-web-v2.0` |
-| [`ducky-cam-web-with-audio/`](ducky-cam-web-with-audio) | Ducky Cam Web plus the host mic over the same tunnel, synced, with mic on/off from the viewer or the web page. Promptable config, no tokens. | `room-cam-web-with-audio-v1.0.0` |
+| [`ducky-cam-web-with-audio/`](ducky-cam-web-with-audio) | Camera or desktop video, monitor switching, microphone + speaker audio, recording, browser viewer, and listener-side password pairing. | `ducky-cam-web-with-audio-v2.0.0` |
 | [`telephone/`](telephone) | One-way live audio between two machines on the same network. Sender finds the receiver by LAN broadcast; no IP to type. | `telephone-v1.0.0` |
 | [`ducky-cam-with-audio/`](ducky-cam-with-audio) | Ducky Cam v2 (auto-discovered LAN webcam viewer) plus the host microphone, streamed in sync, with a mic on/off key. | `room-cam-with-audio-v1.0.0` |
 
@@ -33,19 +33,17 @@ cd ../ducky-cam-web
 pyinstaller --onefile --noconsole webcam_server.py
 pyinstaller --onefile viewer.py
 cd ../ducky-cam-web-with-audio
-pyinstaller --onefile --noconsole --collect-all pycloudflared webcam_server.py
-pyinstaller --onefile viewer.py
+pip install -r requirements.txt
+powershell -File build.ps1
 cd ../ducky-cam-with-audio
 pyinstaller --onefile --noconsole camera_server.py
 pyinstaller --onefile viewer.py
 ```
 
 The host servers (`camera_server.exe`, `webcam_server.exe`) are built without a console so it can sit in the background
-on the host; stop it from Task Manager. The other three keep a console because
+on the host. The combined camera/desktop server has a tray **Stop sharing** control; older projects use Task Manager. Viewers keep a console because
 they print status and take keyboard input.
 
 ## Security note
 
-These are LAN-only tools with demo credentials (`admin` / `1337` in the Ducky
-Cam scripts, none in Telephone). Change the password before relying on them,
-and never expose them to the internet as-is.
+The older LAN projects retain their original demo settings. The combined camera/desktop app uses listener-selected passwords and a tray stop control, but remains a proof of concept with public initial discovery and best-effort tunnel services. Use only authorized devices and read each project's README for its specific limitations.
