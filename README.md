@@ -11,6 +11,7 @@ matching GitHub release (built with PyInstaller `--onefile`).
 | [`ducky-cam-web-with-audio/`](ducky-cam-web-with-audio) | Camera or desktop video, monitor switching, microphone + speaker audio, recording, browser viewer, and listener-side password pairing. | `ducky-cam-web-with-audio-v2.0.0` |
 | [`telephone/`](telephone) | One-way live audio between two machines on the same network. Sender finds the receiver by LAN broadcast; no IP to type. | `telephone-v1.0.0` |
 | [`ducky-cam-with-audio/`](ducky-cam-with-audio) | Ducky Cam v2 (auto-discovered LAN webcam viewer) plus the host microphone, streamed in sync, with a mic on/off key. | `room-cam-with-audio-v1.0.0` |
+| [`deadlink/`](deadlink) | Browser game that teaches binary, IP, DHCP, DNS, ports, subnets and the OSI model, with a simulated Linux troubleshooting terminal. One HTML file, no install. | `deadlink-v2.0.0` |
 
 > Release tags keep their original `room-cam-*` names; the historical binaries live there. New releases will be tagged `ducky-cam-*`.
 

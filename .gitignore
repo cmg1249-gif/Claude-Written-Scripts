@@ -15,3 +15,6 @@ roomcam_*.avi
 .build/
 *.zip
 release-*/
+
+# deadlink build output
+deadlink/source/out/

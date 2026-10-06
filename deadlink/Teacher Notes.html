@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Deadlink Teacher Notes</title>
+<style>
+  @page { size: letter; margin: 0.5in; }
+  body { font-family: Calibri, "Segoe UI", Arial, sans-serif; font-size: 11pt; line-height: 1.4; color: #1a1a1a; max-width: 7.5in; margin: 0 auto; padding: 0.25in; background: #fff; }
+  .banner { background: #1F3A5F; color: #fff; padding: 10px 14px; margin-bottom: 12px; }
+  .banner h1 { font-size: 16pt; margin: 0; letter-spacing: 1px; }
+  .banner .sub { font-size: 9pt; margin-top: 2px; opacity: 0.85; }
+  h2 { font-size: 11.5pt; text-transform: uppercase; letter-spacing: 0.8px; color: #1F3A5F; border-bottom: 2px solid #1F3A5F; padding-bottom: 3px; margin: 16px 0 8px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 10px; }
+  td, th { border: 1px solid #9aa5b1; padding: 6px 8px; vertical-align: top; font-size: 10.5pt; }
+  th { background: #E8EDF3; text-align: left; }
+  code { font-family: Consolas, "Courier New", monospace; font-size: 10pt; background: #f0f3f7; padding: 0 3px; }
+  .flag { background: #FFF4CE; border-left: 4px solid #C8A415; padding: 6px 10px; font-size: 10pt; margin: 10px 0; }
+  .say { color: #1F3A5F; font-style: italic; }
+  li { margin-bottom: 4px; }
+</style>
+</head>
+<body>
+
+<div class="banner">
+  <h1>DEADLINK v2 &mdash; TEACHER NOTES</h1>
+  <div class="sub">Browser game &middot; binary, IP, DHCP, DNS, ports, subnets, OSI &middot; + a Field Terminal with 7 troubleshooting cases &middot; runs in Firefox on Kali, no install, sound optional</div>
+</div>
+
+<p><strong>The story:</strong> a zombie outbreak took the cities and the network went dark one node at a time. Students work from a bunker with a salvaged switch to bring each settlement's node back online, fix what's broken, keep the hordes away, and restore the grid.</p>
+
+<p><strong>The loop (no automation, everything is earned by hand):</strong> answer networking problems at a node &rarr; 8 right <strong>secures</strong> it (&#9733;) &rarr; close that node's <strong>Field Terminal case</strong> with real Linux commands &rarr; spend salvage to bring the next node online. Nothing earns salvage while the tab is closed. Later nodes cost salvage from earlier ones, so students keep going back to practice old skills (binary especially).</p>
+
+<h2>What each node teaches</h2>
+<table>
+<tr><th style="width:16%">Node</th><th style="width:46%">Students do</th><th>Ask while you walk around</th></tr>
+<tr><td>1 Binary</td><td>Flip 4&rarr;8 switches to build numbers; later read binary and type the number. Place values and a running sum show for the first 6 answers, then fade out (press <strong>Send</strong> to check).</td><td class="say">"Why does 255 need all 8 switches?"</td></tr>
+<tr><td>2 IP addresses</td><td>Sort packets: LAN / INTERNET / DROP (octet &gt; 255) / ME (127)</td><td class="say">"Why can't an octet be 300?"</td></tr>
+<tr><td>3 DHCP</td><td>Run DORA: offer a free address, ACK it, avoid IP conflicts</td><td class="say">"What did <code>ipconfig /all</code> hand you that came from here?"</td></tr>
+<tr><td>4 DNS</td><td>Look up names, use the cache (TTL), NXDOMAIN, catch spoofed replies</td><td class="say">"Who should you trust a DNS answer from?"</td></tr>
+<tr><td>5 Ports</td><td>Right door, REFUSED when nothing listens, BLOCK by firewall policy</td><td class="say">"Same as our <code>nc</code> lab: what does refused mean?"</td></tr>
+<tr><td>6 Subnets</td><td>LOCAL or GATEWAY with /24, /16, /8, then /25&ndash;/28. <strong>Subnet math</strong> upgrade: usable hosts, network and broadcast address, smallest subnet for N devices.</td><td class="say">"How many devices fit in a /27? Why minus 2?"</td></tr>
+<tr><td>7 OSI model</td><td><strong>Capstone.</strong> Sort things into the 7 layers. <strong>Incident reports</strong> upgrade: "something is broken, which layer?"</td><td class="say">"Which layer would you check first, and why bottom up?"</td></tr>
+</table>
+
+<h2>The Field Terminal (required to move on)</h2>
+<p>A simulated Linux terminal with one troubleshooting case per node. Each case is <strong>inspect &rarr; fix &rarr; verify &rarr; submit</strong>. Commands are real (<code>ls</code>, <code>cd</code>, <code>cat</code>, <code>ip a</code>, <code>ip route</code>, <code>ping</code>, <code>nslookup</code>, <code>nc -zv</code>, <code>curl</code>, <code>dhclient</code>, <code>traceroute</code>). A few <code>[game action]</code> commands stand in for physical repairs and are shown dashed in the command list so students can tell them apart. Hints are free.</p>
+<table>
+<tr><th style="width:6%">#</th><th style="width:28%">Case</th><th>The fault and the fix (answer key)</th></tr>
+<tr><td>1</td><td>Wake the terminal</td><td><code>ls</code>, <code>cd orders</code>, <code>cat order.txt</code>, <code>ip a</code>, <code>ping 10.0.0.1</code>, <code>submit</code></td></tr>
+<tr><td>2</td><td>The chewed cable</td><td><code>ip link</code> shows NO-CARRIER (Layer 1) &rarr; <code>repair cable</code> &rarr; <code>ping 10.0.0.1</code></td></tr>
+<tr><td>3</td><td>The ghost address</td><td><code>ip a</code> shows 169.254.x.x (DHCP failed) &rarr; <code>dhclient eth0</code> &rarr; <code>ping 10.0.0.12</code></td></tr>
+<tr><td>4</td><td>The missing phone book</td><td>ping by number works, <code>nslookup cache.grid</code> fails &rarr; <code>cat /etc/resolv.conf</code> &rarr; <code>configure dns 10.0.0.1</code> &rarr; nslookup again</td></tr>
+<tr><td>5</td><td>Nobody home on port 80</td><td>ping works, <code>curl http://cache.grid</code> refused, <code>nc -zv cache.grid 80</code> refused &rarr; <code>restart web</code> &rarr; curl again</td></tr>
+<tr><td>6</td><td>No way out</td><td>local ping works, <code>ping 172.16.5.9</code> fails &rarr; <code>ip route</code> shows a dead gateway &rarr; <code>configure gateway 10.0.0.1</code> &rarr; ping again</td></tr>
+<tr><td>7</td><td>Climb the stack</td><td>L1 <code>ip link</code>, L3 <code>ping tower.grid</code>, L4 <code>nc -zv tower.grid 80</code> all fine; <code>curl</code> shows scrambled text &rarr; <code>configure charset utf-8</code> &rarr; <code>submit 6</code> (Presentation layer)</td></tr>
+</table>
+
+<h2>Hordes, hints, crews and calm mode</h2>
+<ul>
+<li><strong>Horde watch:</strong> wrong answers make noise. 4 noise (6 for the Medics crew) draws a horde: salvage at that node is halved and the next node stays locked until 3 right answers push them back. Time-outs and hints <em>never</em> make noise, so slow readers aren't punished.</li>
+<li><strong>Hints (H key):</strong> every node has one. A hinted answer still pays but doesn't build the streak. On Binary, <strong>Reveal place values</strong> and <strong>Walk me through it</strong> (after 2 misses) count as hints too.</li>
+<li><strong>Crews</strong> (picked once at the start): Medics = more room for mistakes, Scavengers = +25% salvage, Ghosts = shake noise faster.</li>
+<li><strong>Calm mode</strong> (Settings &rarr; Learning): turns every timer off. Good for a student who freezes under time pressure, or for a node they're seeing for the first time.</li>
+</ul>
+
+<h2>Learning report</h2>
+<p>The <strong>Report</strong> button shows each node's right / missed / accuracy / hinted / best streak, cases closed, hordes, rank and badges. Students type their name and press <strong>Download CSV</strong> (works in the downloaded file) or <strong>Copy CSV</strong> (works everywhere) and send it to you. "Missed" includes time-outs; "Hinted" means they leaned on help, which tells you who needs a check-in.</p>
+
+<h2>Getting it onto the lab machines</h2>
+<table>
+<tr><th style="width:30%">Option</th><th>How</th></tr>
+<tr><td><strong>1. Link (easiest)</strong></td><td>Share the Claude artifact from its Share menu, put the link on the board. Nothing is downloaded. The save lives in that browser.</td></tr>
+<tr><td><strong>2. The file</strong></td><td><code>Deadlink.html</code> in this folder is the whole game in one file. Copy it over (USB or download) and open it in Firefox. <strong>Cleanup:</strong> <code>rm ~/Downloads/Deadlink.html</code></td></tr>
+</table>
+
+<h2>Teacher tools</h2>
+<p>Add <code>?teacher=1</code> to the end of the address (or <code>#teacher</code>, then reload), then open <strong>Settings</strong>. Buttons: +1,000 of everything, unlock every node, secure every open node, close every open Field Terminal case, clear every horde, install every upgrade on a node, +30 correct. Use them to demo a later node on the projector or catch up an absent student.</p>
+
+<h2>Saves and cleanup</h2>
+<ul>
+<li>Progress saves automatically in that browser. To move it: <strong>Settings &rarr; Save code &rarr; Copy</strong>, then <strong>Load code</strong> on the other machine. Old v1 save codes still load; they get XP credit for past answers and pick a crew.</li>
+<li><strong>End of class:</strong> <strong>Settings &rarr; Wipe my save from this computer</strong> leaves nothing stored. Students copy their save code first if they want to continue next time.</li>
+</ul>
+
+<div class="flag">
+<strong>Make it competitive:</strong> the certificate shows time to restore the grid, accuracy and hints used. Put a board on the whiteboard (name, time, accuracy, fewest hints).
+<br><strong>No sound in the lab?</strong> Fine &mdash; every reward and mistake also flashes on screen. Sound is a bonus.
+<br><strong>Pacing (estimate, not yet timed with students):</strong> about 60&ndash;100 minutes for a full run, so plan on two sessions. Node 1 plus case 1 is a solid 15&ndash;20 minute binary warm-up for a co-taught session; the Field Terminal cases are where most of the time goes.
+</div>
+
+</body>
+</html>
